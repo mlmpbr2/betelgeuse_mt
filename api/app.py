@@ -333,6 +333,7 @@ BATCH_SIZE = 20
 def analyze_sentiment(text):
     """Analisa sentimento de um comentário."""
     if not GOOGLE_API_KEY or not text:
+        print(f"[SENTIMENT] SKIP - no API key or empty text")
         return "NEUTRO"
     try:
         url = f"{GEMINI_URL}?key={GOOGLE_API_KEY}"
@@ -343,15 +344,26 @@ def analyze_sentiment(text):
         }
         resp = requests.post(url, json=payload, timeout=30)
         data = resp.json()
+        print(f"[SENTIMENT] API response: {json.dumps(data)[:200]}")
+
         if "candidates" in data and data["candidates"]:
             result = data["candidates"][0]["content"]["parts"][0]["text"].upper().strip()
+            print(f"[SENTIMENT] Raw result: '{result}'")
             if "POSITIVO" in result:
                 return "POSITIVO"
             elif "NEGATIVO" in result:
                 return "NEGATIVO"
-        return "NEUTRO"
+            else:
+                print(f"[SENTIMENT] Fallback to NEUTRO - result was: '{result}'")
+                return "NEUTRO"
+        elif "error" in data:
+            print(f"[SENTIMENT] API ERROR: {data['error']}")
+            return "NEUTRO"
+        else:
+            print(f"[SENTIMENT] No candidates in response: {json.dumps(data)[:200]}")
+            return "NEUTRO"
     except Exception as e:
-        print(f"Gemini error: {e}")
+        print(f"[SENTIMENT] Exception: {e}")
         return "NEUTRO"
 
 
@@ -601,7 +613,13 @@ CLIENT_DASHBOARD_TEMPLATE = """
         </div>
         <p style="font-size: 14px; margin-bottom: 8px;">{{ comment.message }}</p>
         <div style="font-size: 12px; color: #65676b;">
-            📅 {{ comment.created_time[:10] if comment.created_time else '' }} | 
+            {% if comment.created_time %}
+                {% if comment.created_time is string %}
+                    📅 {{ comment.created_time[:10] }} | 
+                {% else %}
+                    📅 {{ comment.created_time.strftime('%Y-%m-%d') }} | 
+                {% endif %}
+            {% endif %}
             ❤️ {{ comment.like_count }} likes | 
             📝 Post: {{ comment.post_id }}
         </div>
@@ -812,7 +830,7 @@ def poll_client(client_id):
                         "author": author_name, "post_id": post_id
                     })
 
-                all_comments.append({"message": message, "is_new": saved_id is not None})
+                all_comments.append({"message": message, "is_new": saved_id is not None, "saved_id": saved_id})
 
         # Analisa sentimento apenas dos novos comentários
         if new_comments:
@@ -868,6 +886,11 @@ def poll_client(client_id):
             "comments_new": comments_new_count,
             "comments_analyzed": comments_analyzed,
             "cost_brl": cost_brl,
+            "debug": {
+                "total_in_db_before": len(all_comments),
+                "new_comments_count": comments_new_count,
+                "sample_comments": [c["message"][:50] for c in all_comments[:3]]
+            },
             "timestamp": datetime.now().isoformat()
         })
 
