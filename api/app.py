@@ -53,7 +53,8 @@ WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", "betelgeuse_webhoo
 WEBHOOK_APP_SECRET = FB_APP_SECRET
 
 # Billing
-COST_PER_COMMENT_BRL = float(os.environ.get("COST_PER_COMMENT_BRL", "0.20"))
+cost_env = os.environ.get("COST_PER_COMMENT_BRL", "0.20")
+COST_PER_COMMENT_BRL = float(cost_env) if cost_env and cost_env.strip() else 0.20
 
 # In-memory store (Vercel-safe)
 _WEBHOOK_EVENTS = deque(maxlen=100)
