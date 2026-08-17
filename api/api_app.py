@@ -741,7 +741,7 @@ def client_comments_json(api_key):
 # POLLING (N8N chama este endpoint)
 # =============================================================================
 
-@app.route("/poll/<int:client_id>", methods=["POST"])
+@app.route("/poll/<int:client_id>", methods=["GET", "POST"])
 def poll_client(client_id):
     """N8N chama este endpoint para fazer polling de um cliente específico."""
     # Busca cliente
