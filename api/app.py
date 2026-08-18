@@ -1042,36 +1042,6 @@ def health():
     return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
 
 
-@app.route("/test-gemini")
-def test_gemini():
-    """Diagnostico: testa a chamada ao Gemini e expõe o erro real da API."""
-    if not GOOGLE_API_KEY:
-        return jsonify({
-            "status": "error",
-            "reason": "GOOGLE_API_KEY nao configurada no ambiente (Vercel env var ausente)"
-        }), 500
-    url = f"{GEMINI_URL}?key={GOOGLE_API_KEY}"
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": "Classifique o sentimento deste comentario em UMA palavra apenas: POSITIVO, NEUTRO ou NEGATIVO. Comentario: adorei o produto, parabens pelo trabalho!"}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": 100,
-            "thinkingConfig": {"thinkingLevel": "minimal"}
-        }
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=30)
-        return jsonify({
-            "model": GEMINI_MODEL,
-            "api_key_configured": True,
-            "api_key_suffix": f"...{GOOGLE_API_KEY[-4:]}",
-            "http_status": resp.status_code,
-            "gemini_response": resp.json()
-        }), (200 if resp.status_code == 200 else 502)
-    except Exception as e:
-        return jsonify({"status": "error", "reason": str(e)}), 500
-
-
 @app.route("/webhook/logs")
 def webhook_logs():
     logs = []
