@@ -322,7 +322,6 @@ def get_page_token(user_token, page_id):
         print(f"Error fetching page token: {e}")
     return None
 
-
 # =============================================================================
 # SENTIMENT ANALYSIS (Gemini)
 # =============================================================================
@@ -340,11 +339,15 @@ def analyze_sentiment(text):
         prompt = f"Classifique o sentimento deste comentario em UMA palavra apenas: POSITIVO, NEUTRO ou NEGATIVO. Comentario: {text}"
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 10}
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 10,
+                "responseMimeType": "application/json"
+            }
         }
         resp = requests.post(url, json=payload, timeout=30)
         data = resp.json()
-        print(f"[SENTIMENT] API response: {json.dumps(data)[:200]}")
+        print(f"[SENTIMENT] API status={resp.status_code}, response={json.dumps(data)[:300]}")
 
         if "candidates" in data and data["candidates"]:
             result = data["candidates"][0]["content"]["parts"][0]["text"].upper().strip()
@@ -370,6 +373,7 @@ def analyze_sentiment(text):
 def analyze_sentiments_batch(texts):
     """Analisa batch de sentimentos."""
     if not texts or not GOOGLE_API_KEY:
+        print(f"[SENTIMENT-BATCH] SKIP - no texts or no API key")
         return ["NEUTRO"] * len(texts)
     try:
         numbered = "\n".join(f"{i+1}. {t[:280].replace(chr(10), ' ')}" for i, t in enumerate(texts))
@@ -382,31 +386,74 @@ def analyze_sentiments_batch(texts):
         url = f"{GEMINI_URL}?key={GOOGLE_API_KEY}"
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 150}
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 500,
+                "responseMimeType": "application/json"
+            }
         }
         resp = requests.post(url, json=payload, timeout=60)
         data = resp.json()
-        if "candidates" not in data:
+        print(f"[SENTIMENT-BATCH] API status={resp.status_code}")
+
+        if "error" in data:
+            print(f"[SENTIMENT-BATCH] API ERROR: {data['error']}")
             return ["NEUTRO"] * len(texts)
+
+        if "candidates" not in data or not data["candidates"]:
+            print(f"[SENTIMENT-BATCH] No candidates: {json.dumps(data)[:200]}")
+            return ["NEUTRO"] * len(texts)
+
         result_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        print(f"[SENTIMENT-BATCH] Raw result: {result_text[:300]}")
+
+        # Tenta parsear como JSON direto primeiro
+        try:
+            arr = json.loads(result_text)
+            if isinstance(arr, list):
+                sentiments = []
+                for item in arr[:len(texts)]:
+                    s = str(item).upper().strip()
+                    if "POSITIVO" in s:
+                        sentiments.append("POSITIVO")
+                    elif "NEGATIVO" in s:
+                        sentiments.append("NEGATIVO")
+                    else:
+                        sentiments.append("NEUTRO")
+                while len(sentiments) < len(texts):
+                    sentiments.append("NEUTRO")
+                print(f"[SENTIMENT-BATCH] Parsed {len(sentiments)} sentiments: {sentiments}")
+                return sentiments
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: procura array JSON no texto
         match = re.search(r"\[.*\]", result_text, re.DOTALL)
         if match:
-            arr = json.loads(match.group(0))
-            sentiments = []
-            for item in arr[:len(texts)]:
-                s = str(item).upper().strip()
-                if "POSITIVO" in s:
-                    sentiments.append("POSITIVO")
-                elif "NEGATIVO" in s:
-                    sentiments.append("NEGATIVO")
-                else:
+            try:
+                arr = json.loads(match.group(0))
+                sentiments = []
+                for item in arr[:len(texts)]:
+                    s = str(item).upper().strip()
+                    if "POSITIVO" in s:
+                        sentiments.append("POSITIVO")
+                    elif "NEGATIVO" in s:
+                        sentiments.append("NEGATIVO")
+                    else:
+                        sentiments.append("NEUTRO")
+                while len(sentiments) < len(texts):
                     sentiments.append("NEUTRO")
-            while len(sentiments) < len(texts):
-                sentiments.append("NEUTRO")
-            return sentiments
-        return ["NEUTRO"] * len(texts)
+                print(f"[SENTIMENT-BATCH] Regex parsed {len(sentiments)} sentiments")
+                return sentiments
+            except json.JSONDecodeError as e:
+                print(f"[SENTIMENT-BATCH] JSON parse error: {e}")
+
+        print(f"[SENTIMENT-BATCH] Could not parse response, falling back to individual")
+        # Fallback: analisa um por um
+        return [analyze_sentiment(t) for t in texts]
+
     except Exception as e:
-        print(f"Gemini batch error: {e}")
+        print(f"[SENTIMENT-BATCH] Exception: {e}")
         return ["NEUTRO"] * len(texts)
 
 
@@ -420,7 +467,6 @@ def analyze_many(texts):
         for batch_result in executor.map(analyze_sentiments_batch, batches):
             results.extend(batch_result)
     return results
-
 
 # =============================================================================
 # WEBHOOK SECURITY
