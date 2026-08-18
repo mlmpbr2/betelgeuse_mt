@@ -341,7 +341,7 @@ def analyze_sentiment(text):
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 10,
+                "maxOutputTokens": 50,
                 "responseMimeType": "application/json"
             }
         }
