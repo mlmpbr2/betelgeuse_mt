@@ -1038,7 +1038,69 @@ def webhook_logs():
             logs.append(info)
     return jsonify(logs)
 
+# =============================================================================
+# ENDPOINT: Re-analisar sentimentos de comentarios existentes
+# =============================================================================
 
+@app.route("/reanalyze/<int:client_id>", methods=["POST", "GET"])
+def reanalyze_comments(client_id):
+    """Re-analisa sentimentos de comentarios ja existentes no banco."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # Busca comentarios do cliente
+            cur.execute("""
+                SELECT comment_id, message 
+                FROM comments 
+                WHERE client_id = %s 
+                ORDER BY created_time DESC
+                LIMIT 100
+            """, (client_id,))
+            rows = cur.fetchall()
+        
+        if not rows:
+            return jsonify({"status": "ok", "message": "Nenhum comentario encontrado", "reanalyzed": 0})
+        
+        # Prepara para analise em batch
+        texts = [r[1] for r in rows if r[1]]
+        comment_ids = [r[0] for r in rows if r[1]]
+        
+        print(f"[REANALYZE] Cliente {client_id}: {len(texts)} comentarios para re-analisar")
+        
+        # Analisa sentimentos
+        sentiments = analyze_many(texts)
+        
+        # Atualiza no banco
+        updated = 0
+        with conn.cursor() as cur:
+            for cid, sentiment in zip(comment_ids, sentiments):
+                cur.execute("""
+                    UPDATE comments 
+                    SET sentiment = %s, analyzed_at = NOW() 
+                    WHERE comment_id = %s AND client_id = %s
+                """, (sentiment, cid, client_id))
+                updated += 1
+            conn.commit()
+        
+        conn.close()
+        
+        # Conta distribuicao
+        counts = {"POSITIVO": 0, "NEUTRO": 0, "NEGATIVO": 0}
+        for s in sentiments:
+            if s in counts:
+                counts[s] += 1
+        
+        return jsonify({
+            "status": "ok",
+            "client_id": client_id,
+            "reanalyzed": updated,
+            "sentiment_distribution": counts,
+            "sample": list(zip(comment_ids[:5], sentiments[:5]))
+        })
+        
+    except Exception as e:
+        print(f"[REANALYZE] Erro: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 # =============================================================================
 # MAIN (Vercel não usa isso, mas útil para teste local)
 # =============================================================================
