@@ -341,8 +341,8 @@ def analyze_sentiment(text):
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 50,
-                "responseMimeType": "application/json"
+                "maxOutputTokens": 100,
+                "thinkingConfig": {"thinkingLevel": "minimal"}
             }
         }
         resp = requests.post(url, json=payload, timeout=30)
@@ -350,8 +350,14 @@ def analyze_sentiment(text):
         print(f"[SENTIMENT] API status={resp.status_code}, response={json.dumps(data)[:300]}")
 
         if "candidates" in data and data["candidates"]:
-            result = data["candidates"][0]["content"]["parts"][0]["text"].upper().strip()
-            print(f"[SENTIMENT] Raw result: '{result}'")
+            candidate = data["candidates"][0]
+            finish = candidate.get("finishReason", "?")
+            parts = candidate.get("content", {}).get("parts", [])
+            result = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).upper().strip()
+            print(f"[SENTIMENT] finishReason={finish}, raw result: '{result}'")
+            if not result:
+                print(f"[SENTIMENT] Empty content from API (finishReason={finish})")
+                return "NEUTRO"
             if "POSITIVO" in result:
                 return "POSITIVO"
             elif "NEGATIVO" in result:
@@ -388,8 +394,9 @@ def analyze_sentiments_batch(texts):
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 500,
-                "responseMimeType": "application/json"
+                "maxOutputTokens": 2048,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingLevel": "minimal"}
             }
         }
         resp = requests.post(url, json=payload, timeout=60)
@@ -404,8 +411,15 @@ def analyze_sentiments_batch(texts):
             print(f"[SENTIMENT-BATCH] No candidates: {json.dumps(data)[:200]}")
             return ["NEUTRO"] * len(texts)
 
-        result_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        print(f"[SENTIMENT-BATCH] Raw result: {result_text[:300]}")
+        candidate = data["candidates"][0]
+        finish = candidate.get("finishReason", "?")
+        parts = candidate.get("content", {}).get("parts", [])
+        result_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+        print(f"[SENTIMENT-BATCH] finishReason={finish}, raw result: {result_text[:300]}")
+
+        if not result_text:
+            print(f"[SENTIMENT-BATCH] Empty content from API (finishReason={finish})")
+            return ["NEUTRO"] * len(texts)
 
         # Tenta parsear como JSON direto primeiro
         try:
