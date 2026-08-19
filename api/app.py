@@ -1,7 +1,7 @@
 """
 Betelgeuse TI - Multitenant API
 Flask app para Vercel - Cada cliente conecta sua própria página do Facebook
-Versão: 2026-08-17
+Versão: 2026-08-19 - Dashboard por post, primeira importação e billing transparente
 """
 
 import os
@@ -133,7 +133,8 @@ def get_client_by_api_key(api_key):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, name, email, page_id, page_name, access_token_encrypted,
-                       api_key, n8n_webhook_url, is_active, total_comments_processed, total_cost_brl
+                       api_key, n8n_webhook_url, is_active, total_comments_processed, total_cost_brl,
+                       first_import_at, first_import_count
                 FROM clients WHERE api_key = %s AND is_active = TRUE
             """, (api_key,))
             row = cur.fetchone()
@@ -142,7 +143,8 @@ def get_client_by_api_key(api_key):
                     "id": row[0], "name": row[1], "email": row[2], "page_id": row[3],
                     "page_name": row[4], "access_token_encrypted": row[5], "api_key": row[6],
                     "n8n_webhook_url": row[7], "is_active": row[8],
-                    "total_comments_processed": row[9], "total_cost_brl": row[10]
+                    "total_comments_processed": row[9], "total_cost_brl": row[10],
+                    "first_import_at": row[11], "first_import_count": row[12]
                 }
             return None
     finally:
@@ -196,6 +198,48 @@ def save_comment(client_id, comment_id, post_id, author_name, message, sentiment
     except Exception as e:
         print(f"Error saving comment: {e}")
         return None
+    finally:
+        conn.close()
+
+
+def save_posts(client_id, posts):
+    """Upsert em lote de posts do Facebook (para agrupar comentários no dashboard)."""
+    if not posts:
+        return
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, client_id=client_id)
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO posts (client_id, post_id, message, permalink_url, created_time)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (client_id, post_id) DO UPDATE SET
+                    message = EXCLUDED.message,
+                    permalink_url = EXCLUDED.permalink_url
+            """, [(client_id, p.get("id"), p.get("message", ""),
+                   p.get("permalink_url", ""), p.get("created_time")) for p in posts])
+            conn.commit()
+    except Exception as e:
+        print(f"Error saving posts: {e}")
+    finally:
+        conn.close()
+
+
+def mark_first_import(client_id, comments_count):
+    """Registra a primeira importação do cliente (só na primeira vez)."""
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, is_superadmin=True)
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE clients
+                SET first_import_at = COALESCE(first_import_at, NOW()),
+                    first_import_count = GREATEST(COALESCE(first_import_count, 0), %s)
+                WHERE id = %s
+            """, (comments_count, client_id))
+            conn.commit()
+    except Exception as e:
+        print(f"Error marking first import: {e}")
     finally:
         conn.close()
 
@@ -261,6 +305,82 @@ def get_client_comments(client_id, limit=100, sentiment_filter=None):
                 "sentiment": r[4], "like_count": r[5], "created_time": r[6],
                 "analyzed_at": r[7], "is_new": r[8], "source": r[9]
             } for r in rows]
+    finally:
+        conn.close()
+
+
+def get_client_posts_with_comments(client_id, limit_posts=20, comments_per_post=100):
+    """Posts do cliente com comentários agrupados. Retorna (posts, outros_comentarios)."""
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, client_id=client_id)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT post_id, message, permalink_url, created_time
+                FROM posts WHERE client_id = %s
+                ORDER BY created_time DESC NULLS LAST LIMIT %s
+            """, (client_id, limit_posts))
+            posts = [{
+                "post_id": r[0], "message": r[1] or "", "permalink_url": r[2] or "",
+                "created_time": r[3], "comments": []
+            } for r in cur.fetchall()]
+            post_map = {p["post_id"]: p for p in posts}
+
+            cur.execute("""
+                SELECT comment_id, post_id, author_name, message, sentiment, like_count, created_time
+                FROM comments WHERE client_id = %s
+                ORDER BY created_time DESC LIMIT 500
+            """, (client_id,))
+            others = []
+            for r in cur.fetchall():
+                comment = {
+                    "comment_id": r[0], "post_id": r[1], "author_name": r[2],
+                    "message": r[3], "sentiment": r[4], "like_count": r[5], "created_time": r[6]
+                }
+                p = post_map.get(r[1])
+                if p is None:
+                    others.append(comment)
+                elif len(p["comments"]) < comments_per_post:
+                    p["comments"].append(comment)
+
+            for p in posts:
+                counts = {"POSITIVO": 0, "NEUTRO": 0, "NEGATIVO": 0}
+                for c in p["comments"]:
+                    if c["sentiment"] in counts:
+                        counts[c["sentiment"]] += 1
+                p["counts"] = counts
+            return posts, others
+    finally:
+        conn.close()
+
+
+def get_client_billing(client_id):
+    """Billing do cliente: (resumo mensal, últimos poll_logs)."""
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, client_id=client_id)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT to_char(analyzed_at, 'YYYY-MM') AS mes, COUNT(*) AS qtd
+                FROM comments
+                WHERE client_id = %s AND analyzed_at IS NOT NULL
+                GROUP BY 1 ORDER BY 1 DESC
+            """, (client_id,))
+            monthly = [{"mes": r[0], "qtd": r[1], "custo": float(r[1]) * COST_PER_COMMENT_BRL}
+                       for r in cur.fetchall()]
+
+            cur.execute("""
+                SELECT polled_at, posts_checked, comments_found, comments_new,
+                       comments_analyzed, cost_brl, triggered_by
+                FROM poll_logs WHERE client_id = %s
+                ORDER BY polled_at DESC LIMIT 30
+            """, (client_id,))
+            polls = [{
+                "polled_at": r[0], "posts_checked": r[1], "comments_found": r[2],
+                "comments_new": r[3], "comments_analyzed": r[4],
+                "cost_brl": float(r[5] or 0), "triggered_by": r[6]
+            } for r in cur.fetchall()]
+            return monthly, polls
     finally:
         conn.close()
 
@@ -562,13 +682,16 @@ BASE_TEMPLATE = """
         .stat-value { font-size: 28px; font-weight: 700; color: #1877f2; }
         .stat-label { font-size: 12px; color: #65676b; text-transform: uppercase; }
         .comment-card { background: #f8f9fa; border-radius: 12px; padding: 16px; margin-bottom: 12px; border-left: 4px solid #1877f2; }
-        .comment-card.positive { border-left-color: #2e7d32; background: #e8f5e9; }
-        .comment-card.neutral { border-left-color: #f9a825; background: #fff8e1; }
-        .comment-card.negative { border-left-color: #c62828; background: #ffebee; }
+        .comment-card.positive, .comment-card.positivo { border-left-color: #2e7d32; background: #e8f5e9; }
+        .comment-card.neutral, .comment-card.neutro { border-left-color: #f9a825; background: #fff8e1; }
+        .comment-card.negative, .comment-card.negativo { border-left-color: #c62828; background: #ffebee; }
         .sentiment-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
-        .sentiment-positive { background: #2e7d32; color: white; }
-        .sentiment-neutral { background: #f9a825; color: white; }
-        .sentiment-negative { background: #c62828; color: white; }
+        .sentiment-positive, .sentiment-positivo { background: #2e7d32; color: white; }
+        .sentiment-neutral, .sentiment-neutro { background: #f9a825; color: white; }
+        .sentiment-negative, .sentiment-negativo { background: #c62828; color: white; }
+        table.data-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        table.data-table th { text-align: left; padding: 8px; border-bottom: 2px solid #ddd; color: #65676b; font-size: 12px; text-transform: uppercase; }
+        table.data-table td { padding: 8px; border-bottom: 1px solid #eee; }
         input, select { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #ddd; font-size: 15px; background: white; margin-bottom: 12px; }
         label { font-size: 13px; font-weight: 600; color: #65676b; display: block; margin-bottom: 4px; }
         .form-group { margin-bottom: 16px; }
@@ -620,6 +743,18 @@ SUCCESS_TEMPLATE = """
     <h2 style="font-size: 20px; margin-bottom: 12px;">{{ page_name }}</h2>
     <p style="color: #65676b; margin-bottom: 16px;">Page ID: {{ page_id }}</p>
 
+    {% if import_info %}
+    <div class="alert alert-info" style="text-align: left;">
+        📥 <strong>Primeira sincronização concluída:</strong>
+        {{ import_info.comments_new }} comentários importados de {{ import_info.posts_checked }} posts
+        — custo: R$ {{ "%.2f"|format(import_info.cost_brl) }}
+    </div>
+    {% else %}
+    <div class="alert alert-warning" style="text-align: left;">
+        ⏳ A primeira sincronização será concluída automaticamente no próximo ciclo (em até 1 hora).
+    </div>
+    {% endif %}
+
     <div style="background: #f8f9fa; padding: 16px; border-radius: 8px; text-align: left; margin-bottom: 20px;">
         <h3 style="font-size: 14px; margin-bottom: 8px;">🔑 Sua API Key:</h3>
         <div class="code-box">{{ api_key }}</div>
@@ -636,10 +771,21 @@ CLIENT_DASHBOARD_TEMPLATE = """
         <div>
             <h2 style="font-size: 20px;">{{ client.name }}</h2>
             <p style="color: #65676b; font-size: 13px;">{{ client.page_name }} | Page ID: {{ client.page_id }}</p>
+            {% if client.first_import_at %}
+            <p style="color: #65676b; font-size: 12px; margin-top: 4px;">
+                📥 Primeira importação: <strong>{{ client.first_import_count }} comentários</strong> em
+                {% if client.first_import_at is string %}
+                    {{ client.first_import_at[:10] }}
+                {% else %}
+                    {{ client.first_import_at.strftime('%d/%m/%Y') }}
+                {% endif %}
+            </p>
+            {% endif %}
         </div>
         <div style="text-align: right;">
             <p style="font-size: 12px; color: #65676b;">Comentários processados</p>
             <p style="font-size: 24px; font-weight: 700; color: #1877f2;">{{ client.total_comments_processed }}</p>
+            <a href="/client/{{ client.api_key }}/billing" class="btn btn-outline" style="margin-top: 8px;">💰 Meu faturamento</a>
         </div>
     </div>
 
@@ -663,9 +809,28 @@ CLIENT_DASHBOARD_TEMPLATE = """
     </div>
 </div>
 
+{% for post in posts %}
 <div class="card">
-    <div class="card-title">💬 Últimos Comentários</div>
-    {% for comment in comments %}
+    <div style="margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #eee;">
+        <p style="font-size: 14px; font-weight: 600;">
+            📝 {{ post.message[:200] if post.message else '(Post sem texto)' }}{% if post.message|length > 200 %}...{% endif %}
+        </p>
+        <div style="font-size: 12px; color: #65676b; margin-top: 4px;">
+            {% if post.created_time %}
+                {% if post.created_time is string %}
+                    📅 {{ post.created_time[:10] }} |
+                {% else %}
+                    📅 {{ post.created_time.strftime('%d/%m/%Y') }} |
+                {% endif %}
+            {% endif %}
+            💬 {{ post.comments|length }} comentários
+            (😊 {{ post.counts.POSITIVO }} · 😐 {{ post.counts.NEUTRO }} · 😠 {{ post.counts.NEGATIVO }})
+            {% if post.permalink_url %}
+                | <a href="{{ post.permalink_url }}" target="_blank" style="color: #1877f2;">Ver no Facebook ↗</a>
+            {% endif %}
+        </div>
+    </div>
+    {% for comment in post.comments %}
     <div class="comment-card {{ comment.sentiment|lower }}">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <strong style="font-size: 14px;">{{ comment.author_name or 'Usuário' }}</strong>
@@ -675,18 +840,154 @@ CLIENT_DASHBOARD_TEMPLATE = """
         <div style="font-size: 12px; color: #65676b;">
             {% if comment.created_time %}
                 {% if comment.created_time is string %}
-                    📅 {{ comment.created_time[:10] }} | 
+                    📅 {{ comment.created_time[:10] }} |
                 {% else %}
-                    📅 {{ comment.created_time.strftime('%Y-%m-%d') }} | 
+                    📅 {{ comment.created_time.strftime('%Y-%m-%d') }} |
                 {% endif %}
             {% endif %}
-            ❤️ {{ comment.like_count }} likes | 
-            📝 Post: {{ comment.post_id }}
+            ❤️ {{ comment.like_count }} likes
         </div>
     </div>
     {% else %}
-    <p style="color: #65676b; text-align: center; padding: 20px;">Nenhum comentário encontrado ainda.</p>
+    <p style="color: #65676b; font-size: 13px;">Nenhum comentário neste post ainda.</p>
     {% endfor %}
+</div>
+{% else %}
+<div class="card">
+    <p style="color: #65676b; text-align: center; padding: 20px;">
+        Nenhum post sincronizado ainda. A primeira sincronização acontece automaticamente no próximo ciclo (em até 1 hora).
+    </p>
+</div>
+{% endfor %}
+
+{% if other_comments %}
+<div class="card">
+    <div class="card-title">💬 Outros comentários</div>
+    <p class="card-desc">Comentários recebidos em tempo real, antes da sincronização do post.</p>
+    {% for comment in other_comments %}
+    <div class="comment-card {{ comment.sentiment|lower }}">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <strong style="font-size: 14px;">{{ comment.author_name or 'Usuário' }}</strong>
+            <span class="sentiment-badge sentiment-{{ comment.sentiment|lower }}">{{ comment.sentiment }}</span>
+        </div>
+        <p style="font-size: 14px; margin-bottom: 8px;">{{ comment.message }}</p>
+        <div style="font-size: 12px; color: #65676b;">
+            {% if comment.created_time %}
+                {% if comment.created_time is string %}
+                    📅 {{ comment.created_time[:10] }} |
+                {% else %}
+                    📅 {{ comment.created_time.strftime('%Y-%m-%d') }} |
+                {% endif %}
+            {% endif %}
+            📝 Post: {{ comment.post_id }}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+"""
+
+BILLING_TEMPLATE = """
+<style>
+@media print {
+    .header, .footer, .no-print { display: none !important; }
+    body { background: white; }
+    .card { box-shadow: none; border: 1px solid #ddd; page-break-inside: avoid; }
+}
+</style>
+
+<div class="card">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+            <h2 style="font-size: 20px;">💰 Faturamento — {{ client.name }}</h2>
+            <p style="color: #65676b; font-size: 13px;">{{ client.page_name }} | Page ID: {{ client.page_id }}</p>
+        </div>
+        <button onclick="window.print()" class="btn btn-primary no-print">🖨️ Salvar como PDF / Imprimir</button>
+    </div>
+</div>
+
+<div class="stats-grid" style="grid-template-columns: repeat(3, 1fr);">
+    <div class="stat-box">
+        <div class="stat-value">{{ total_analyzed }}</div>
+        <div class="stat-label">💬 Comentários analisados</div>
+    </div>
+    <div class="stat-box">
+        <div class="stat-value">R$ {{ "%.2f"|format(client.total_cost_brl) }}</div>
+        <div class="stat-label">💰 Custo total</div>
+    </div>
+    <div class="stat-box" style="border-top-color: #2e7d32;">
+        <div class="stat-value" style="color: #2e7d32;">R$ {{ "%.2f"|format(current.custo) }}</div>
+        <div class="stat-label">📅 Mês atual ({{ current.qtd }} comentários)</div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-title">📅 Detalhamento mensal</div>
+    <p class="card-desc">
+        Você paga <strong>R$ {{ "%.2f"|format(price) }} por comentário analisado</strong>.
+        Apenas comentários NOVOS são cobrados — sincronizações sem novidades custam R$ 0,00.
+    </p>
+    <table class="data-table">
+        <thead>
+            <tr><th>Mês</th><th>Comentários</th><th>R$/comentário</th><th>Total</th></tr>
+        </thead>
+        <tbody>
+            {% for m in monthly %}
+            <tr>
+                <td>{{ m.mes_label }}</td>
+                <td>{{ m.qtd }}</td>
+                <td>R$ {{ "%.2f"|format(price) }}</td>
+                <td><strong>R$ {{ "%.2f"|format(m.custo) }}</strong></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" style="text-align: center; color: #65676b; padding: 16px;">Nenhum comentário analisado ainda.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="card">
+    <div class="card-title">ℹ️ Como calculamos</div>
+    <p style="font-size: 14px; color: #444; line-height: 1.8;">
+        O valor de <strong>R$ {{ "%.2f"|format(price) }} por comentário</strong> cobre a infraestrutura de
+        automação (N8N), a análise de sentimento por IA (Google Gemini), o banco de dados e a
+        manutenção e evolução da plataforma. Sua página tem <strong>volume alto de comentários</strong>?
+        Fale conosco — oferecemos condições especiais por volume.
+    </p>
+</div>
+
+<div class="card">
+    <div class="card-title">🔄 Histórico de sincronizações</div>
+    <p class="card-desc">Cada linha é um ciclo de verificação da sua página (a cada hora). Custo só existe quando há comentários novos.</p>
+    <table class="data-table">
+        <thead>
+            <tr><th>Data</th><th>Origem</th><th>Posts</th><th>Novos</th><th>Analisados</th><th>Custo</th></tr>
+        </thead>
+        <tbody>
+            {% for p in polls %}
+            <tr>
+                <td>
+                    {% if p.polled_at is string %}
+                        {{ p.polled_at[:16] }}
+                    {% else %}
+                        {{ p.polled_at.strftime('%d/%m/%Y %H:%M') }}
+                    {% endif %}
+                </td>
+                <td>{{ p.origem_label }}</td>
+                <td>{{ p.posts_checked }}</td>
+                <td>{{ p.comments_new }}</td>
+                <td>{{ p.comments_analyzed }}</td>
+                <td>R$ {{ "%.2f"|format(p.cost_brl) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" style="text-align: center; color: #65676b; padding: 16px;">Nenhuma sincronização registrada ainda.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div style="text-align: center; margin-bottom: 20px;" class="no-print">
+    <a href="/client/{{ client.api_key }}/dashboard" class="btn btn-outline">← Voltar ao dashboard</a>
 </div>
 """
 
@@ -766,11 +1067,28 @@ def callback():
         # Salva no Supabase
         result = save_client(user_name, user_email, page_id, page_name, page_token)
 
+        # Primeira importação: baixa comentários históricos e analisa sentimento
+        import_info = None
+        try:
+            first_client = {
+                "id": result["id"], "page_id": page_id,
+                "page_name": page_name, "n8n_webhook_url": ""
+            }
+            import_info = run_poll_for_client(
+                first_client, page_token,
+                triggered_by="first_import", source="first_import"
+            )
+            mark_first_import(result["id"], import_info["comments_new"])
+        except Exception as e:
+            print(f"[FIRST-IMPORT] Erro (não bloqueia onboarding): {e}")
+            import_info = None
+
         # Renderiza sucesso
-        content = render_template_string(SUCCESS_TEMPLATE, 
-            page_name=page_name, 
-            page_id=page_id, 
-            api_key=result["api_key"]
+        content = render_template_string(SUCCESS_TEMPLATE,
+            page_name=page_name,
+            page_id=page_id,
+            api_key=result["api_key"],
+            import_info=import_info
         )
         return render_template_string(BASE_TEMPLATE, content=content)
 
@@ -784,16 +1102,62 @@ def client_dashboard(api_key):
     if not client:
         return "Cliente não encontrado", 404
 
-    comments = get_client_comments(client["id"], limit=50)
+    posts, other_comments = get_client_posts_with_comments(client["id"])
     sentiment_counts = {"POSITIVO": 0, "NEUTRO": 0, "NEGATIVO": 0}
-    for c in comments:
+    for p in posts:
+        for c in p["comments"]:
+            if c["sentiment"] in sentiment_counts:
+                sentiment_counts[c["sentiment"]] += 1
+    for c in other_comments:
         if c["sentiment"] in sentiment_counts:
             sentiment_counts[c["sentiment"]] += 1
 
-    content = render_template_string(CLIENT_DASHBOARD_TEMPLATE, 
-        client=client, 
-        comments=comments,
+    content = render_template_string(CLIENT_DASHBOARD_TEMPLATE,
+        client=client,
+        posts=posts,
+        other_comments=other_comments,
         sentiment_counts=sentiment_counts
+    )
+    return render_template_string(BASE_TEMPLATE, content=content)
+
+
+MESES_PT = ["", "jan", "fev", "mar", "abr", "mai", "jun",
+            "jul", "ago", "set", "out", "nov", "dez"]
+
+
+@app.route("/client/<api_key>/billing")
+def client_billing(api_key):
+    """Página de faturamento transparente do cliente (imprimível em PDF)."""
+    client = get_client_by_api_key(api_key)
+    if not client:
+        return "Cliente não encontrado", 404
+
+    monthly, polls = get_client_billing(client["id"])
+
+    for m in monthly:
+        year, month = m["mes"].split("-")
+        m["mes_label"] = f"{MESES_PT[int(month)]}/{year}"
+
+    origem_labels = {
+        "first_import": "📥 Primeira importação",
+        "n8n": "🤖 Automático (N8N)",
+        "api": "🔌 API"
+    }
+    for p in polls:
+        p["origem_label"] = origem_labels.get(p["triggered_by"], p["triggered_by"])
+
+    current_month = datetime.now().strftime("%Y-%m")
+    current = next((m for m in monthly if m["mes"] == current_month),
+                   {"qtd": 0, "custo": 0.0})
+    total_analyzed = sum(m["qtd"] for m in monthly)
+
+    content = render_template_string(BILLING_TEMPLATE,
+        client=client,
+        monthly=monthly,
+        polls=polls,
+        current=current,
+        total_analyzed=total_analyzed,
+        price=COST_PER_COMMENT_BRL
     )
     return render_template_string(BASE_TEMPLATE, content=content)
 
@@ -818,6 +1182,124 @@ def client_comments_json(api_key):
 # =============================================================================
 # POLLING (N8N chama este endpoint)
 # =============================================================================
+
+def run_poll_for_client(client, access_token, triggered_by="n8n", source="polling",
+                        max_posts=10, max_comments=200):
+    """Busca posts e comentários do Facebook, salva, analisa sentimento dos
+    comentários novos, cobra e registra log. Usado pelo /poll (N8N) e pela
+    primeira importação no /callback. Retorna dict com métricas do ciclo."""
+    # Pega posts da página
+    posts_data = fb_get(f"{client['page_id']}/posts",
+                       {"fields": "id,message,created_time,permalink_url", "limit": max_posts},
+                       access_token)
+    posts = posts_data.get("data", [])
+
+    # Upsert dos posts (para agrupar comentários no dashboard)
+    save_posts(client["id"], posts)
+
+    new_comments = []
+    sample_comments = []
+    posts_checked = len(posts)
+    comments_found = 0
+    comments_new_count = 0
+    comments_analyzed = 0
+    sentiments = []
+
+    for post in posts:
+        post_id = post["id"]
+        comments_data, _ = fb_get_paginated(
+            f"{post_id}/comments",
+            {"fields": "id,from,message,created_time,like_count", "limit": 100, "order": "reverse_chronological"},
+            access_token,
+            max_items=max_comments
+        )
+
+        for c in comments_data:
+            comments_found += 1
+            comment_id = c["id"]
+            author_name = c.get("from", {}).get("name", "Facebook User")
+            message = c.get("message", "")
+            created_time = c.get("created_time", datetime.now().isoformat())
+            like_count = c.get("like_count", 0)
+
+            if len(sample_comments) < 3:
+                sample_comments.append(message[:50])
+
+            # Tenta salvar (ON CONFLICT DO NOTHING retorna None se já existe)
+            saved_id = save_comment(
+                client["id"], comment_id, post_id, author_name,
+                message, "NEUTRO", like_count, created_time, source
+            )
+
+            if saved_id:
+                comments_new_count += 1
+                new_comments.append({
+                    "id": comment_id, "message": message,
+                    "author": author_name, "post_id": post_id
+                })
+
+    # Analisa sentimento apenas dos novos comentários
+    if new_comments:
+        texts = [c["message"] for c in new_comments]
+        sentiments = analyze_many(texts)
+
+        # Atualiza sentimentos no banco
+        conn = get_db_connection()
+        try:
+            set_rls_client(conn, client_id=client["id"])
+            with conn.cursor() as cur:
+                for nc, sentiment in zip(new_comments, sentiments):
+                    cur.execute("""
+                        UPDATE comments SET sentiment = %s, analyzed_at = NOW()
+                        WHERE client_id = %s AND comment_id = %s
+                    """, (sentiment, client["id"], nc["id"]))
+                conn.commit()
+        finally:
+            conn.close()
+
+        comments_analyzed = len(new_comments)
+
+    # Calcula custo
+    cost_brl = comments_analyzed * COST_PER_COMMENT_BRL
+
+    # Atualiza estatísticas
+    update_client_stats(client["id"], comments_new_count, cost_brl)
+
+    # Salva log
+    save_poll_log(client["id"], posts_checked, comments_found,
+                 comments_new_count, comments_analyzed, cost_brl,
+                 triggered_by=triggered_by)
+
+    # Envia para webhook N8N do cliente
+    if client.get("n8n_webhook_url") and new_comments:
+        try:
+            requests.post(client["n8n_webhook_url"], json={
+                "client_id": client["id"],
+                "page_name": client["page_name"],
+                "new_comments": new_comments,
+                "sentiments": sentiments,
+                "timestamp": datetime.now().isoformat()
+            }, timeout=10)
+        except Exception as e:
+            print(f"Erro ao enviar para N8N: {e}")
+
+    return {
+        "status": "ok",
+        "client_id": client["id"],
+        "page_name": client["page_name"],
+        "posts_checked": posts_checked,
+        "comments_found": comments_found,
+        "comments_new": comments_new_count,
+        "comments_analyzed": comments_analyzed,
+        "cost_brl": cost_brl,
+        "triggered_by": triggered_by,
+        "debug": {
+            "new_comments_count": comments_new_count,
+            "sample_comments": sample_comments
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
 
 @app.route("/poll/<int:client_id>", methods=["GET", "POST"])
 def poll_client(client_id):
@@ -847,113 +1329,7 @@ def poll_client(client_id):
         return jsonify({"error": "Não foi possível descriptografar o token"}), 500
 
     try:
-        # Pega posts da página
-        posts_data = fb_get(f"{client['page_id']}/posts", 
-                           {"fields": "id,message,created_time", "limit": 10}, 
-                           access_token)
-        posts = posts_data.get("data", [])
-
-        all_comments = []
-        new_comments = []
-        posts_checked = len(posts)
-        comments_found = 0
-        comments_new_count = 0
-        comments_analyzed = 0
-
-        for post in posts:
-            post_id = post["id"]
-            comments_data, _ = fb_get_paginated(
-                f"{post_id}/comments",
-                {"fields": "id,from,message,created_time,like_count", "limit": 100, "order": "reverse_chronological"},
-                access_token,
-                max_items=200
-            )
-
-            for c in comments_data:
-                comments_found += 1
-                comment_id = c["id"]
-                author_name = c.get("from", {}).get("name", "Facebook User")
-                message = c.get("message", "")
-                created_time = c.get("created_time", datetime.now().isoformat())
-                like_count = c.get("like_count", 0)
-
-                # Tenta salvar (ON CONFLICT DO NOTHING retorna None se já existe)
-                saved_id = save_comment(
-                    client["id"], comment_id, post_id, author_name, 
-                    message, "NEUTRO", like_count, created_time, "polling"
-                )
-
-                if saved_id:
-                    comments_new_count += 1
-                    new_comments.append({
-                        "id": comment_id, "message": message, 
-                        "author": author_name, "post_id": post_id
-                    })
-
-                all_comments.append({"message": message, "is_new": saved_id is not None, "saved_id": saved_id})
-
-        # Analisa sentimento apenas dos novos comentários
-        if new_comments:
-            texts = [c["message"] for c in new_comments]
-            sentiments = analyze_many(texts)
-
-            # Atualiza sentimentos no banco
-            conn = get_db_connection()
-            try:
-                set_rls_client(conn, client_id=client["id"])
-                with conn.cursor() as cur:
-                    for nc, sentiment in zip(new_comments, sentiments):
-                        cur.execute("""
-                            UPDATE comments SET sentiment = %s, analyzed_at = NOW()
-                            WHERE client_id = %s AND comment_id = %s
-                        """, (sentiment, client["id"], nc["id"]))
-                    conn.commit()
-            finally:
-                conn.close()
-
-            comments_analyzed = len(new_comments)
-
-        # Calcula custo
-        cost_brl = comments_analyzed * COST_PER_COMMENT_BRL
-
-        # Atualiza estatísticas
-        update_client_stats(client["id"], comments_new_count, cost_brl)
-
-        # Salva log
-        save_poll_log(client["id"], posts_checked, comments_found, 
-                     comments_new_count, comments_analyzed, cost_brl, 
-                     triggered_by="n8n")
-
-        # Envia para webhook N8N do cliente
-        if client["n8n_webhook_url"] and new_comments:
-            try:
-                requests.post(client["n8n_webhook_url"], json={
-                    "client_id": client["id"],
-                    "page_name": client["page_name"],
-                    "new_comments": new_comments,
-                    "sentiments": sentiments if new_comments else [],
-                    "timestamp": datetime.now().isoformat()
-                }, timeout=10)
-            except Exception as e:
-                print(f"Erro ao enviar para N8N: {e}")
-
-        return jsonify({
-            "status": "ok",
-            "client_id": client["id"],
-            "page_name": client["page_name"],
-            "posts_checked": posts_checked,
-            "comments_found": comments_found,
-            "comments_new": comments_new_count,
-            "comments_analyzed": comments_analyzed,
-            "cost_brl": cost_brl,
-            "debug": {
-                "total_in_db_before": len(all_comments),
-                "new_comments_count": comments_new_count,
-                "sample_comments": [c["message"][:50] for c in all_comments[:3]]
-            },
-            "timestamp": datetime.now().isoformat()
-        })
-
+        return jsonify(run_poll_for_client(client, access_token, triggered_by="n8n"))
     except Exception as e:
         save_poll_log(client["id"], 0, 0, 0, 0, 0.0, str(e), "n8n")
         return jsonify({"error": str(e)}), 500
