@@ -56,6 +56,9 @@ WEBHOOK_APP_SECRET = FB_APP_SECRET
 cost_env = os.environ.get("COST_PER_COMMENT_BRL", "0.20")
 COST_PER_COMMENT_BRL = float(cost_env) if cost_env and cost_env.strip() else 0.20
 
+# Admin (relatório diário para o N8N)
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+
 # In-memory store (Vercel-safe)
 _WEBHOOK_EVENTS = deque(maxlen=100)
 
@@ -134,7 +137,7 @@ def get_client_by_api_key(api_key):
             cur.execute("""
                 SELECT id, name, email, page_id, page_name, access_token_encrypted,
                        api_key, n8n_webhook_url, is_active, total_comments_processed, total_cost_brl,
-                       first_import_at, first_import_count
+                       first_import_at, first_import_count, backfill_status, backfill_completed_at
                 FROM clients WHERE api_key = %s AND is_active = TRUE
             """, (api_key,))
             row = cur.fetchone()
@@ -144,7 +147,8 @@ def get_client_by_api_key(api_key):
                     "page_name": row[4], "access_token_encrypted": row[5], "api_key": row[6],
                     "n8n_webhook_url": row[7], "is_active": row[8],
                     "total_comments_processed": row[9], "total_cost_brl": row[10],
-                    "first_import_at": row[11], "first_import_count": row[12]
+                    "first_import_at": row[11], "first_import_count": row[12],
+                    "backfill_status": row[13], "backfill_completed_at": row[14]
                 }
             return None
     finally:
@@ -152,7 +156,8 @@ def get_client_by_api_key(api_key):
 
 
 def save_client(name, email, page_id, page_name, access_token, n8n_webhook_url=""):
-    """Salva novo cliente no Supabase."""
+    """Salva novo cliente no Supabase. Ao reconectar (conflito no page_id),
+    mantém a api_key existente para não invalidar o acesso do cliente."""
     api_key = hashlib.sha256(f"{page_id}{datetime.now().isoformat()}".encode()).hexdigest()[:32]
     encrypted_token = encrypt_token(access_token)
 
@@ -168,7 +173,6 @@ def save_client(name, email, page_id, page_name, access_token, n8n_webhook_url="
                     email = EXCLUDED.email,
                     page_name = EXCLUDED.page_name,
                     access_token_encrypted = EXCLUDED.access_token_encrypted,
-                    api_key = EXCLUDED.api_key,
                     n8n_webhook_url = EXCLUDED.n8n_webhook_url,
                     is_active = TRUE
                 RETURNING id, api_key
@@ -180,18 +184,18 @@ def save_client(name, email, page_id, page_name, access_token, n8n_webhook_url="
         conn.close()
 
 
-def save_comment(client_id, comment_id, post_id, author_name, message, sentiment, like_count, created_time, source="webhook"):
-    """Salva comentário no Supabase."""
+def save_comment(client_id, comment_id, post_id, author_name, message, sentiment, like_count, created_time, source="webhook", is_new=True):
+    """Salva comentário no Supabase. is_new=False no backfill (histórico)."""
     conn = get_db_connection()
     try:
         set_rls_client(conn, client_id=client_id)
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO comments (client_id, comment_id, post_id, author_name, message, sentiment, like_count, created_time, source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO comments (client_id, comment_id, post_id, author_name, message, sentiment, like_count, created_time, source, is_new)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (client_id, comment_id) DO NOTHING
                 RETURNING id
-            """, (client_id, comment_id, post_id, author_name, message, sentiment, like_count, created_time, source))
+            """, (client_id, comment_id, post_id, author_name, message, sentiment, like_count, created_time, source, is_new))
             row = cur.fetchone()
             conn.commit()
             return row[0] if row else None
@@ -354,6 +358,33 @@ def get_client_posts_with_comments(client_id, limit_posts=20, comments_per_post=
         conn.close()
 
 
+def update_backfill_state(client_id, status, cursor=None, completed=False):
+    """Atualiza o checkpoint do backfill do cliente."""
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, is_superadmin=True)
+        with conn.cursor() as cur:
+            if completed:
+                cur.execute("""
+                    UPDATE clients
+                    SET backfill_status = %s, backfill_cursor = NULL, backfill_completed_at = NOW()
+                    WHERE id = %s
+                """, (status, client_id))
+            elif cursor is not None:
+                cur.execute("""
+                    UPDATE clients SET backfill_status = %s, backfill_cursor = %s WHERE id = %s
+                """, (status, cursor, client_id))
+            else:
+                cur.execute("""
+                    UPDATE clients SET backfill_status = %s WHERE id = %s
+                """, (status, client_id))
+            conn.commit()
+    except Exception as e:
+        print(f"Error updating backfill state: {e}")
+    finally:
+        conn.close()
+
+
 def get_client_billing(client_id):
     """Billing do cliente: (resumo mensal, últimos poll_logs)."""
     conn = get_db_connection()
@@ -381,6 +412,27 @@ def get_client_billing(client_id):
                 "cost_brl": float(r[5] or 0), "triggered_by": r[6]
             } for r in cur.fetchall()]
             return monthly, polls
+    finally:
+        conn.close()
+
+
+def get_client_daily_usage(client_id, days=30):
+    """Uso por dia do cliente (view daily_usage), com custo calculado."""
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, client_id=client_id)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT day, comments_analyzed
+                FROM daily_usage
+                WHERE client_id = %s AND day >= CURRENT_DATE - %s
+                ORDER BY day DESC
+            """, (client_id, days))
+            return [{
+                "day": r[0].isoformat() if r[0] else None,
+                "comments_analyzed": r[1],
+                "cost_brl": round(float(r[1]) * COST_PER_COMMENT_BRL, 2)
+            } for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -601,6 +653,29 @@ def analyze_many(texts):
         for batch_result in executor.map(analyze_sentiments_batch, batches):
             results.extend(batch_result)
     return results
+
+
+def analyze_and_update_comments(client_id, new_comments):
+    """Analisa sentimento dos comentários novos e atualiza no banco.
+    Retorna a lista de sentimentos (mesma ordem de new_comments)."""
+    if not new_comments:
+        return []
+    texts = [c["message"] for c in new_comments]
+    sentiments = analyze_many(texts)
+
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, client_id=client_id)
+        with conn.cursor() as cur:
+            for nc, sentiment in zip(new_comments, sentiments):
+                cur.execute("""
+                    UPDATE comments SET sentiment = %s, analyzed_at = NOW()
+                    WHERE client_id = %s AND comment_id = %s
+                """, (sentiment, client_id, nc["id"]))
+            conn.commit()
+    finally:
+        conn.close()
+    return sentiments
 
 # =============================================================================
 # WEBHOOK SECURITY
@@ -1240,23 +1315,7 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
 
     # Analisa sentimento apenas dos novos comentários
     if new_comments:
-        texts = [c["message"] for c in new_comments]
-        sentiments = analyze_many(texts)
-
-        # Atualiza sentimentos no banco
-        conn = get_db_connection()
-        try:
-            set_rls_client(conn, client_id=client["id"])
-            with conn.cursor() as cur:
-                for nc, sentiment in zip(new_comments, sentiments):
-                    cur.execute("""
-                        UPDATE comments SET sentiment = %s, analyzed_at = NOW()
-                        WHERE client_id = %s AND comment_id = %s
-                    """, (sentiment, client["id"], nc["id"]))
-                conn.commit()
-        finally:
-            conn.close()
-
+        sentiments = analyze_and_update_comments(client["id"], new_comments)
         comments_analyzed = len(new_comments)
 
     # Calcula custo
