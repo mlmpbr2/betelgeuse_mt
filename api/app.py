@@ -1134,43 +1134,71 @@ def callback():
                 </div>
             """)
 
-        # Pega a primeira página (ou poderia ter um seletor)
-        page = pages[0]
-        page_id = page["id"]
-        page_name = page["name"]
-        page_token = page.get("access_token", user_token)
+        # 🔄 ITERA SOBRE TODAS AS PÁGINAS (não só a primeira!)
+        connected_pages = []
+        for page in pages:
+            page_id = page["id"]
+            page_name = page["name"]
+            page_token = page.get("access_token", user_token)
 
-        # Salva no Supabase
-        result = save_client(user_name, user_email, page_id, page_name, page_token)
+            # Salva no Supabase
+            result = save_client(user_name, user_email, page_id, page_name, page_token)
 
-        # Primeira importação: baixa comentários históricos e analisa sentimento
-        import_info = None
-        try:
-            first_client = {
-                "id": result["id"], "page_id": page_id,
-                "page_name": page_name, "n8n_webhook_url": ""
-            }
-            import_info = run_poll_for_client(
-                first_client, page_token,
-                triggered_by="first_import", source="first_import"
-            )
-            mark_first_import(result["id"], import_info["comments_new"])
-        except Exception as e:
-            print(f"[FIRST-IMPORT] Erro (não bloqueia onboarding): {e}")
+            # Primeira importação: baixa comentários históricos
             import_info = None
+            try:
+                first_client = {
+                    "id": result["id"], "page_id": page_id,
+                    "page_name": page_name, "n8n_webhook_url": ""
+                }
+                import_info = run_poll_for_client(
+                    first_client, page_token,
+                    triggered_by="first_import", source="first_import"
+                )
+                mark_first_import(result["id"], import_info["comments_new"])
+            except Exception as e:
+                print(f"[FIRST-IMPORT] Erro em {page_name} (não bloqueia): {e}")
+                import_info = None
 
-        # Renderiza sucesso
-        content = render_template_string(SUCCESS_TEMPLATE,
-            page_name=page_name,
-            page_id=page_id,
-            api_key=result["api_key"],
-            import_info=import_info
-        )
+            connected_pages.append({
+                "page_name": page_name,
+                "page_id": page_id,
+                "api_key": result["api_key"],
+                "import_info": import_info
+            })
+
+        # Renderiza sucesso com TODAS as páginas
+        content = f"""
+        <div class="card" style="text-align: center;">
+            <div class="alert alert-success">
+                ✅ <strong>{len(connected_pages)} página(s) conectada(s) com sucesso!</strong>
+            </div>
+        </div>
+        """
+        for p in connected_pages:
+            import_html = ""
+            if p["import_info"]:
+                import_html = f"""
+                <div style="background: #e3f2fd; border-radius: 8px; padding: 12px; margin: 12px 0;">
+                    📥 <strong>Primeira sincronização:</strong> {p['import_info']['comments_new']} comentários importados de {p['import_info']['posts_checked']} posts — custo: R$ {p['import_info']['cost_brl']:.2f}
+                </div>
+                """
+            content += f"""
+            <div class="card" style="margin-bottom: 16px;">
+                <h3>📄 {p['page_name']}</h3>
+                <p style="color: #65676b; font-size: 13px;">Page ID: {p['page_id']}</p>
+                {import_html}
+                <div style="background: #1a1a2e; color: white; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 13px; margin: 12px 0;">
+                    🔑 API Key: {p['api_key']}
+                </div>
+                <a href="/client/{p['api_key']}/dashboard" class="btn btn-primary">📊 Ver Dashboard</a>
+            </div>
+            """
+        
         return render_template_string(BASE_TEMPLATE, content=content)
 
     except Exception as e:
         return f"Erro: {str(e)}", 500
-
 
 @app.route("/client/<api_key>/dashboard")
 def client_dashboard(api_key):
