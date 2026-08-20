@@ -1085,6 +1085,7 @@ def login():
         f"&redirect_uri={REDIRECT_URI}"
         f"&scope={scopes}"
         f"&response_type=code"
+        f"&auth_type=reauthenticate"  # ← Seletor de Pg.
     )
     return redirect(auth_url)
 
