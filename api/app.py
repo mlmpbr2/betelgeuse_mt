@@ -1139,39 +1139,58 @@ def callback():
                 </div>
             """)
 
-        # 🔄 ITERA SOBRE TODAS AS PÁGINAS (não só a primeira!)
+        # 🔄 Processa SÓ a primeira página com importação leve.
+        # As demais são salvas sem importação síncrona (evita timeout no login);
+        # o N8N faz o polling delas nos ciclos seguintes (a cada hora).
+        main_page = pages[0]
+        extra_pages = pages[1:]
+
         connected_pages = []
-        for page in pages:
-            page_id = page["id"]
-            page_name = page["name"]
-            page_token = page.get("access_token", user_token)
 
-            # Salva no Supabase
-            result = save_client(user_name, user_email, page_id, page_name, page_token)
+        # === PRIMEIRA PÁGINA (com importação leve) ===
+        page_id = main_page["id"]
+        page_name = main_page["name"]
+        page_token = main_page.get("access_token", user_token)
 
-            # Primeira importação: baixa comentários históricos
+        # Salva no Supabase
+        result = save_client(user_name, user_email, page_id, page_name, page_token)
+
+        # Primeira importação: baixa comentários históricos
+        import_info = None
+        try:
+            first_client = {
+                "id": result["id"], "page_id": page_id,
+                "page_name": page_name, "n8n_webhook_url": ""
+            }
+            import_info = run_poll_for_client(
+                first_client, page_token,
+                triggered_by="first_import", source="first_import",
+                max_posts=FIRST_IMPORT_MAX_POSTS,
+                max_comments=FIRST_IMPORT_MAX_COMMENTS
+            )
+            mark_first_import(result["id"], import_info["comments_new"])
+        except Exception as e:
+            print(f"[FIRST-IMPORT] Erro em {page_name} (não bloqueia): {e}")
             import_info = None
-            try:
-                first_client = {
-                    "id": result["id"], "page_id": page_id,
-                    "page_name": page_name, "n8n_webhook_url": ""
-                }
-                import_info = run_poll_for_client(
-                    first_client, page_token,
-                    triggered_by="first_import", source="first_import",
-                    max_posts=FIRST_IMPORT_MAX_POSTS,
-                    max_comments=FIRST_IMPORT_MAX_COMMENTS
-                )
-                mark_first_import(result["id"], import_info["comments_new"])
-            except Exception as e:
-                print(f"[FIRST-IMPORT] Erro em {page_name} (não bloqueia): {e}")
-                import_info = None
 
+        connected_pages.append({
+            "page_name": page_name,
+            "page_id": page_id,
+            "api_key": result["api_key"],
+            "import_info": import_info
+        })
+
+        # === DEMAIS PÁGINAS (salva só no banco, sem importação) ===
+        for extra in extra_pages:
+            extra_id = extra["id"]
+            extra_name = extra["name"]
+            extra_token = extra.get("access_token", user_token)
+            extra_result = save_client(user_name, user_email, extra_id, extra_name, extra_token)
             connected_pages.append({
-                "page_name": page_name,
-                "page_id": page_id,
-                "api_key": result["api_key"],
-                "import_info": import_info
+                "page_name": extra_name,
+                "page_id": extra_id,
+                "api_key": extra_result["api_key"],
+                "import_info": None
             })
 
         # Renderiza sucesso com TODAS as páginas
