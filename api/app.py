@@ -62,6 +62,10 @@ COST_PER_COMMENT_BRL = float(cost_env) if cost_env and cost_env.strip() else 0.2
 FIRST_IMPORT_MAX_POSTS = int(os.environ.get("FIRST_IMPORT_MAX_POSTS", "3"))
 FIRST_IMPORT_MAX_COMMENTS = int(os.environ.get("FIRST_IMPORT_MAX_COMMENTS", "50"))
 
+# Freemium: análises gratuitas por cliente (além delas, só com créditos pagos).
+# Requer: ALTER TABLE clients ADD COLUMN IF NOT EXISTS paid_analysis_count INTEGER DEFAULT 0;
+FREE_ANALYSIS_LIMIT = int(os.environ.get("FREE_ANALYSIS_LIMIT", "50"))
+
 # Admin (relatório diário para o N8N)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
@@ -288,6 +292,39 @@ def update_client_stats(client_id, comments_count, cost_brl):
         print(f"Error updating client stats: {e}")
     finally:
         conn.close()
+
+
+def get_analysis_quota(client_id):
+    """Cota de análises do cliente (freemium).
+    Retorna dict: analyzed (comentários com sentiment), free_limit, paid,
+    allowed, remaining (análises ainda disponíveis)."""
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, is_superadmin=True)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(paid_analysis_count, 0) FROM clients WHERE id = %s",
+                (client_id,))
+            paid = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM comments WHERE client_id = %s AND sentiment IS NOT NULL",
+                (client_id,))
+            analyzed = cur.fetchone()[0]
+    finally:
+        conn.close()
+    allowed = FREE_ANALYSIS_LIMIT + paid
+    return {
+        "analyzed": analyzed,
+        "free_limit": FREE_ANALYSIS_LIMIT,
+        "paid": paid,
+        "allowed": allowed,
+        "remaining": max(0, allowed - analyzed)
+    }
+
+
+def can_analyze_comment(client_id):
+    """True se o cliente ainda tem análises disponíveis (grátis + pagas)."""
+    return get_analysis_quota(client_id)["remaining"] > 0
 
 
 def get_client_comments(client_id, limit=100, sentiment_filter=None):
