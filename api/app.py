@@ -56,6 +56,11 @@ WEBHOOK_APP_SECRET = FB_APP_SECRET
 cost_env = os.environ.get("COST_PER_COMMENT_BRL", "0.20")
 COST_PER_COMMENT_BRL = float(cost_env) if cost_env and cost_env.strip() else 0.20
 
+# Primeira importação no /callback: limites menores para não travar o login.
+# O histórico completo é processado nos ciclos de polling seguintes (N8N).
+FIRST_IMPORT_MAX_POSTS = int(os.environ.get("FIRST_IMPORT_MAX_POSTS", "3"))
+FIRST_IMPORT_MAX_COMMENTS = int(os.environ.get("FIRST_IMPORT_MAX_COMMENTS", "50"))
+
 # Admin (relatório diário para o N8N)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
@@ -153,7 +158,6 @@ def get_client_by_api_key(api_key):
             return None
     finally:
         conn.close()
-
 
 def save_client(name, email, page_id, page_name, access_token, n8n_webhook_url=""):
     """Salva novo cliente no Supabase. Ao reconectar (conflito no page_id),
@@ -825,8 +829,9 @@ SUCCESS_TEMPLATE = """
         — custo: R$ {{ "%.2f"|format(import_info.cost_brl) }}
     </div>
     {% else %}
-    <div class="alert alert-warning" style="text-align: left;">
-        ⏳ A primeira sincronização será concluída automaticamente no próximo ciclo (em até 1 hora).
+    <div class="alert alert-info" style="text-align: left;">
+        🔄 <strong>Sincronização automática ativa</strong> — os comentários serão processados
+        automaticamente nos próximos ciclos (a cada hora).
     </div>
     {% endif %}
 
@@ -1153,7 +1158,9 @@ def callback():
                 }
                 import_info = run_poll_for_client(
                     first_client, page_token,
-                    triggered_by="first_import", source="first_import"
+                    triggered_by="first_import", source="first_import",
+                    max_posts=FIRST_IMPORT_MAX_POSTS,
+                    max_comments=FIRST_IMPORT_MAX_COMMENTS
                 )
                 mark_first_import(result["id"], import_info["comments_new"])
             except Exception as e:
@@ -1176,11 +1183,17 @@ def callback():
         </div>
         """
         for p in connected_pages:
-            import_html = ""
             if p["import_info"]:
                 import_html = f"""
                 <div style="background: #e3f2fd; border-radius: 8px; padding: 12px; margin: 12px 0;">
-                    📥 <strong>Primeira sincronização:</strong> {p['import_info']['comments_new']} comentários importados de {p['import_info']['posts_checked']} posts — custo: R$ {p['import_info']['cost_brl']:.2f}
+                    📥 <strong>Sincronização inicial:</strong> {p['import_info']['comments_new']} comentários importados de {p['import_info']['posts_checked']} posts — custo: R$ {p['import_info']['cost_brl']:.2f}<br>
+                    <span style="font-size: 12px; color: #1565c0;">Esta é uma importação inicial parcial. O histórico completo é processado automaticamente nos próximos ciclos (a cada hora).</span>
+                </div>
+                """
+            else:
+                import_html = """
+                <div style="background: #e3f2fd; border-radius: 8px; padding: 12px; margin: 12px 0;">
+                    🔄 <strong>Sincronização automática ativa</strong> — os comentários serão processados automaticamente nos próximos ciclos (a cada hora).
                 </div>
                 """
             content += f"""
