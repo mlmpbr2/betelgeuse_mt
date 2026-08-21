@@ -147,7 +147,8 @@ def get_client_by_api_key(api_key):
             cur.execute("""
                 SELECT id, name, email, page_id, page_name, access_token_encrypted,
                        api_key, n8n_webhook_url, is_active, total_comments_processed, total_cost_brl,
-                       first_import_at, first_import_count, backfill_status, backfill_completed_at
+                       first_import_at, first_import_count, backfill_status, backfill_completed_at,
+                       paid_analysis_count
                 FROM clients WHERE api_key = %s AND is_active = TRUE
             """, (api_key,))
             row = cur.fetchone()
@@ -158,7 +159,8 @@ def get_client_by_api_key(api_key):
                     "n8n_webhook_url": row[7], "is_active": row[8],
                     "total_comments_processed": row[9], "total_cost_brl": row[10],
                     "first_import_at": row[11], "first_import_count": row[12],
-                    "backfill_status": row[13], "backfill_completed_at": row[14]
+                    "backfill_status": row[13], "backfill_completed_at": row[14],
+                    "paid_analysis_count": row[15] or 0
                 }
             return None
     finally:
@@ -877,7 +879,7 @@ BASE_TEMPLATE = """
 <body>
     <div class="header">
         <h1>🌟 Betelgeuse TI</h1>
-        <p>MONITORAMENTO MULTITENANT DE COMENTÁRIOS</p>
+        <p>ANÁLISE DE SENTIMENTOS — COMPREENDA MELHOR SUA REDE SOCIAL</p>
     </div>
     <div class="container">
         {{ content | safe }}
@@ -1012,7 +1014,11 @@ CLIENT_DASHBOARD_TEMPLATE = """
     <div class="comment-card {{ comment.sentiment|lower }}">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <strong style="font-size: 14px;">{{ comment.author_name or 'Usuário' }}</strong>
+            {% if comment.sentiment %}
             <span class="sentiment-badge sentiment-{{ comment.sentiment|lower }}">{{ comment.sentiment }}</span>
+            {% else %}
+            <span style="background: #9e9e9e; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;">⏳ Análise disponível após pagamento</span>
+            {% endif %}
         </div>
         <p style="font-size: 14px; margin-bottom: 8px;">{{ comment.message }}</p>
         <div style="font-size: 12px; color: #65676b;">
@@ -1070,7 +1076,11 @@ CLIENT_DASHBOARD_TEMPLATE = """
     <div class="comment-card {{ comment.sentiment|lower }}">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <strong style="font-size: 14px;">{{ comment.author_name or 'Usuário' }}</strong>
+            {% if comment.sentiment %}
             <span class="sentiment-badge sentiment-{{ comment.sentiment|lower }}">{{ comment.sentiment }}</span>
+            {% else %}
+            <span style="background: #9e9e9e; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;">⏳ Análise disponível após pagamento</span>
+            {% endif %}
         </div>
         <p style="font-size: 14px; margin-bottom: 8px;">{{ comment.message }}</p>
         <div style="font-size: 12px; color: #65676b;">
@@ -1108,13 +1118,26 @@ BILLING_TEMPLATE = """
     </div>
 </div>
 
+{% if is_freemium %}
+<div class="alert alert-success">
+    🎉 <strong>Você está no plano gratuito!</strong> As primeiras {{ free_limit }} análises de sentimento são por nossa conta.
+    Libere a análise de todos os comentários — assine o plano R$ {{ "%.2f"|format(price) }} por comentário
+    e tenha um panorama completo de sua página com insights valiosos.
+</div>
+{% endif %}
+
 <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr);">
     <div class="stat-box">
+        {% if is_freemium %}
+        <div class="stat-value">{{ free_used }} de {{ free_limit }}</div>
+        <div class="stat-label">💬 Comentários analisados (grátis)</div>
+        {% else %}
         <div class="stat-value">{{ total_analyzed }}</div>
         <div class="stat-label">💬 Comentários analisados</div>
+        {% endif %}
     </div>
     <div class="stat-box">
-        <div class="stat-value">R$ {{ "%.2f"|format(client.total_cost_brl) }}</div>
+        <div class="stat-value">R$ {{ "%.2f"|format(total_cost) }}</div>
         <div class="stat-label">💰 Custo total</div>
     </div>
     <div class="stat-box" style="border-top-color: #2e7d32;">
@@ -1398,6 +1421,17 @@ def client_billing(api_key):
 
     monthly, polls = get_client_billing(client["id"])
 
+    # Freemium: as primeiras FREE_ANALYSIS_LIMIT análises são grátis.
+    # Só há cobrança quando o cliente comprou créditos (paid_analysis_count > 0);
+    # nesse caso o custo total é créditos pagos × preço por comentário.
+    paid = client.get("paid_analysis_count") or 0
+    is_freemium = paid == 0
+    if is_freemium:
+        for m in monthly:
+            m["custo"] = 0.0
+        for p in polls:
+            p["cost_brl"] = 0.0
+
     for m in monthly:
         year, month = m["mes"].split("-")
         m["mes_label"] = f"{MESES_PT[int(month)]}/{year}"
@@ -1414,6 +1448,8 @@ def client_billing(api_key):
     current = next((m for m in monthly if m["mes"] == current_month),
                    {"qtd": 0, "custo": 0.0})
     total_analyzed = sum(m["qtd"] for m in monthly)
+    free_used = min(total_analyzed, FREE_ANALYSIS_LIMIT)
+    total_cost = 0.0 if is_freemium else paid * COST_PER_COMMENT_BRL
 
     content = render_template_string(BILLING_TEMPLATE,
         client=client,
@@ -1421,6 +1457,10 @@ def client_billing(api_key):
         polls=polls,
         current=current,
         total_analyzed=total_analyzed,
+        is_freemium=is_freemium,
+        free_limit=FREE_ANALYSIS_LIMIT,
+        free_used=free_used,
+        total_cost=total_cost,
         price=COST_PER_COMMENT_BRL
     )
     return render_template_string(BASE_TEMPLATE, content=content)
