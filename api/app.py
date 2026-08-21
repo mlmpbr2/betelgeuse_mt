@@ -1450,8 +1450,12 @@ def client_comments_json(api_key):
 def run_poll_for_client(client, access_token, triggered_by="n8n", source="polling",
                         max_posts=10, max_comments=200):
     """Busca posts e comentários do Facebook, salva, analisa sentimento dos
-    comentários novos, cobra e registra log. Usado pelo /poll (N8N) e pela
-    primeira importação no /callback. Retorna dict com métricas do ciclo."""
+    comentários novos (respeitando a cota freemium), cobra e registra log.
+    Usado pelo /poll (N8N) e pela primeira importação no /callback.
+    Retorna dict com métricas do ciclo."""
+    quota = get_analysis_quota(client["id"])
+    remaining = quota["remaining"]
+
     # Pega posts da página
     posts_data = fb_get(f"{client['page_id']}/posts",
                        {"fields": "id,message,created_time,permalink_url", "limit": max_posts},
@@ -1489,10 +1493,12 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
             if len(sample_comments) < 3:
                 sample_comments.append(message[:50])
 
-            # Tenta salvar (ON CONFLICT DO NOTHING retorna None se já existe)
+            # Tenta salvar (ON CONFLICT DO NOTHING retorna None se já existe).
+            # sentiment=NULL até a análise: comentários além da cota ficam
+            # sem sentimento (não contam na cota nem no custo).
             saved_id = save_comment(
                 client["id"], comment_id, post_id, author_name,
-                message, "NEUTRO", like_count, created_time, source
+                message, None, like_count, created_time, source
             )
 
             if saved_id:
@@ -1502,10 +1508,13 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
                     "author": author_name, "post_id": post_id
                 })
 
-    # Analisa sentimento apenas dos novos comentários
-    if new_comments:
-        sentiments = analyze_and_update_comments(client["id"], new_comments)
-        comments_analyzed = len(new_comments)
+    # Analisa sentimento apenas dos novos comentários, até o limite da cota.
+    # O excedente fica com sentiment NULL (recuperável quando houver créditos).
+    allowed_comments = new_comments[:remaining]
+    comments_skipped_quota = len(new_comments) - len(allowed_comments)
+    if allowed_comments:
+        sentiments = analyze_and_update_comments(client["id"], allowed_comments)
+        comments_analyzed = len(allowed_comments)
 
     # Calcula custo
     cost_brl = comments_analyzed * COST_PER_COMMENT_BRL
@@ -1518,14 +1527,16 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
                  comments_new_count, comments_analyzed, cost_brl,
                  triggered_by=triggered_by)
 
-    # Envia para webhook N8N do cliente
+    # Envia para webhook N8N do cliente (comentários analisados, alinhados
+    # com a lista de sentiments; excedente de cota vai só com a flag)
     if client.get("n8n_webhook_url") and new_comments:
         try:
             requests.post(client["n8n_webhook_url"], json={
                 "client_id": client["id"],
                 "page_name": client["page_name"],
-                "new_comments": new_comments,
+                "new_comments": allowed_comments,
                 "sentiments": sentiments,
+                "quota_exceeded": comments_skipped_quota > 0,
                 "timestamp": datetime.now().isoformat()
             }, timeout=10)
         except Exception as e:
@@ -1539,6 +1550,13 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
         "comments_found": comments_found,
         "comments_new": comments_new_count,
         "comments_analyzed": comments_analyzed,
+        "comments_skipped_quota": comments_skipped_quota,
+        "quota": {
+            "analyzed": quota["analyzed"] + comments_analyzed,
+            "free_limit": quota["free_limit"],
+            "paid": quota["paid"],
+            "remaining": max(0, remaining - comments_analyzed)
+        },
         "cost_brl": cost_brl,
         "triggered_by": triggered_by,
         "debug": {
@@ -1618,8 +1636,10 @@ def webhook_receive():
             # Busca cliente pelo page_id
             client = get_client_by_page_id(info["page_id"])
             if client:
-                # Analisa sentimento
-                sentiment = analyze_sentiment(info["message"])
+                # Analisa sentimento só se houver saldo na cota freemium;
+                # sem saldo, salva com sentiment NULL (custo 0, recuperável depois)
+                has_quota = can_analyze_comment(client["id"])
+                sentiment = analyze_sentiment(info["message"]) if has_quota else None
 
                 # Salva comentário
                 save_comment(
@@ -1634,8 +1654,9 @@ def webhook_receive():
                     "webhook"
                 )
 
-                # Atualiza stats
-                update_client_stats(client["id"], 1, COST_PER_COMMENT_BRL)
+                # Atualiza stats (custo só quando houve análise)
+                update_client_stats(client["id"], 1,
+                                    COST_PER_COMMENT_BRL if has_quota else 0.0)
 
                 # Envia para N8N
                 if client["n8n_webhook_url"]:
@@ -1646,6 +1667,7 @@ def webhook_receive():
                             "event": "new_comment",
                             "comment": info,
                             "sentiment": sentiment,
+                            "quota_exceeded": not has_quota,
                             "timestamp": datetime.now().isoformat()
                         }, timeout=10)
                     except Exception as e:

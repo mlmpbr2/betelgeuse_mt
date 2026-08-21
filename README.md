@@ -33,6 +33,23 @@ Execute `supabase/migration_2026-08-19.sql` no Supabase SQL Editor. Ela cria:
 - Tabela `posts` (comentários agrupados por post no dashboard)
 - Colunas `first_import_at` e `first_import_count` em `clients`
 
+### Freemium (Etapa 1)
+
+Execute no Supabase SQL Editor:
+
+```sql
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS paid_analysis_count INTEGER DEFAULT 0;
+```
+
+### Backfill de posts (histórico completo de uma página)
+
+Para importar posts/comentários históricos de um cliente **sem custo**
+(sentiment = NULL, sem Gemini, sem consumir cota):
+
+```bash
+SUPABASE_DB_URL=... TOKEN_SECRET=... python scripts/backfill_repow.py [--client-id N]
+```
+
 ## Backoffice Streamlit
 
 ```bash
@@ -58,9 +75,14 @@ streamlit run admin/superadmin.py
 
 1. N8N chama `POST /poll/{client_id}` a cada 1h
 2. API busca posts e comentários novos no Facebook (upsert em `posts`)
-3. Analisa sentimento via Gemini **apenas dos comentários novos**
+3. Analisa sentimento via Gemini **apenas dos comentários novos, até o limite da cota**
+   (freemium: `FREE_ANALYSIS_LIMIT` = 50 análises grátis + `paid_analysis_count` pagas;
+   o excedente é salvo com `sentiment = NULL`, sem custo, recuperável depois)
 4. Salva no Supabase
-5. Envia webhook para URL do cliente
+5. Envia webhook para URL do cliente (payload inclui `quota_exceeded` e `comments_skipped_quota`)
+
+> O webhook em tempo real (`/webhook`) segue a mesma cota: sem saldo, o
+> comentário é salvo sem análise e o payload vai com `quota_exceeded: true`.
 
 > Os resumos de manhã / meio-dia / fim de tarde são fluxos do N8N que
 > consomem `GET /client/{api_key}/comments` — nada a configurar na API.
