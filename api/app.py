@@ -7,6 +7,7 @@ Versão: 2026-08-19 - Dashboard por post, primeira importação e billing transp
 import os
 import re
 import json
+import math
 import base64
 import hashlib
 import hmac
@@ -317,39 +318,72 @@ def get_client_comments(client_id, limit=100, sentiment_filter=None):
         conn.close()
 
 
-def get_client_posts_with_comments(client_id, limit_posts=20, comments_per_post=100):
-    """Posts do cliente com comentários agrupados. Retorna (posts, outros_comentarios)."""
+PER_PAGE_OPTIONS = (10, 20, 50, 100)
+
+
+def get_client_posts_with_comments(client_id, page=1, per_page=10, comments_per_post=100):
+    """Posts do cliente com comentários agrupados, paginado.
+    Retorna dict: posts, others, total_posts, total_pages, page, per_page."""
+    if per_page not in PER_PAGE_OPTIONS:
+        per_page = 10
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    offset = (page - 1) * per_page
+
     conn = get_db_connection()
     try:
         set_rls_client(conn, client_id=client_id)
         with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM posts WHERE client_id = %s", (client_id,))
+            total_posts = cur.fetchone()[0]
+            total_pages = max(1, math.ceil(total_posts / per_page))
+            if page > total_pages:
+                page = total_pages
+                offset = (page - 1) * per_page
+
             cur.execute("""
                 SELECT post_id, message, permalink_url, created_time
                 FROM posts WHERE client_id = %s
-                ORDER BY created_time DESC NULLS LAST LIMIT %s
-            """, (client_id, limit_posts))
+                ORDER BY created_time DESC NULLS LAST LIMIT %s OFFSET %s
+            """, (client_id, per_page, offset))
             posts = [{
                 "post_id": r[0], "message": r[1] or "", "permalink_url": r[2] or "",
                 "created_time": r[3], "comments": []
             } for r in cur.fetchall()]
             post_map = {p["post_id"]: p for p in posts}
 
+            # Comentários apenas dos posts da página atual
+            if post_map:
+                cur.execute("""
+                    SELECT comment_id, post_id, author_name, message, sentiment, like_count, created_time
+                    FROM comments WHERE client_id = %s AND post_id = ANY(%s)
+                    ORDER BY created_time DESC
+                """, (client_id, list(post_map.keys())))
+                for r in cur.fetchall():
+                    comment = {
+                        "comment_id": r[0], "post_id": r[1], "author_name": r[2],
+                        "message": r[3], "sentiment": r[4], "like_count": r[5], "created_time": r[6]
+                    }
+                    p = post_map.get(r[1])
+                    if p is not None and len(p["comments"]) < comments_per_post:
+                        p["comments"].append(comment)
+
+            # Comentários cujo post não existe na tabela posts (chegaram via webhook)
             cur.execute("""
                 SELECT comment_id, post_id, author_name, message, sentiment, like_count, created_time
-                FROM comments WHERE client_id = %s
-                ORDER BY created_time DESC LIMIT 500
-            """, (client_id,))
-            others = []
-            for r in cur.fetchall():
-                comment = {
-                    "comment_id": r[0], "post_id": r[1], "author_name": r[2],
-                    "message": r[3], "sentiment": r[4], "like_count": r[5], "created_time": r[6]
-                }
-                p = post_map.get(r[1])
-                if p is None:
-                    others.append(comment)
-                elif len(p["comments"]) < comments_per_post:
-                    p["comments"].append(comment)
+                FROM comments
+                WHERE client_id = %s
+                  AND (post_id IS NULL OR post_id NOT IN (
+                      SELECT post_id FROM posts WHERE client_id = %s
+                  ))
+                ORDER BY created_time DESC LIMIT 100
+            """, (client_id, client_id))
+            others = [{
+                "comment_id": r[0], "post_id": r[1], "author_name": r[2],
+                "message": r[3], "sentiment": r[4], "like_count": r[5], "created_time": r[6]
+            } for r in cur.fetchall()]
 
             for p in posts:
                 counts = {"POSITIVO": 0, "NEUTRO": 0, "NEGATIVO": 0}
@@ -357,7 +391,34 @@ def get_client_posts_with_comments(client_id, limit_posts=20, comments_per_post=
                     if c["sentiment"] in counts:
                         counts[c["sentiment"]] += 1
                 p["counts"] = counts
-            return posts, others
+
+            return {
+                "posts": posts,
+                "others": others,
+                "total_posts": total_posts,
+                "total_pages": total_pages,
+                "page": page,
+                "per_page": per_page
+            }
+    finally:
+        conn.close()
+
+
+def get_client_sentiment_counts(client_id):
+    """Totais globais de sentimento do cliente (independem da página do dashboard)."""
+    counts = {"POSITIVO": 0, "NEUTRO": 0, "NEGATIVO": 0}
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, client_id=client_id)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT sentiment, COUNT(*) FROM comments
+                WHERE client_id = %s GROUP BY sentiment
+            """, (client_id,))
+            for sentiment, qtd in cur.fetchall():
+                if sentiment in counts:
+                    counts[sentiment] = qtd
+            return counts
     finally:
         conn.close()
 
@@ -940,6 +1001,30 @@ CLIENT_DASHBOARD_TEMPLATE = """
 </div>
 {% endfor %}
 
+{% if total_posts > 0 %}
+<div class="card" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+    <div style="font-size: 13px; color: #65676b;">
+        Posts por página:
+        {% for opt in [10, 20, 50, 100] %}
+            {% if opt == per_page %}
+                <span class="btn btn-outline" style="background: #1877f2; color: white; cursor: default;">{{ opt }}</span>
+            {% else %}
+                <a href="/client/{{ client.api_key }}/dashboard?page=1&per_page={{ opt }}" class="btn btn-outline">{{ opt }}</a>
+            {% endif %}
+        {% endfor %}
+    </div>
+    <div style="font-size: 13px; color: #65676b; display: flex; align-items: center; gap: 10px;">
+        {% if page > 1 %}
+            <a href="/client/{{ client.api_key }}/dashboard?page={{ page - 1 }}&per_page={{ per_page }}" class="btn btn-outline">« Anterior</a>
+        {% endif %}
+        <span>Página {{ page }} de {{ total_pages }} ({{ total_posts }} posts)</span>
+        {% if page < total_pages %}
+            <a href="/client/{{ client.api_key }}/dashboard?page={{ page + 1 }}&per_page={{ per_page }}" class="btn btn-outline">Próximo »</a>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
 {% if other_comments %}
 <div class="card">
     <div class="card-title">💬 Outros comentários</div>
@@ -1238,21 +1323,27 @@ def client_dashboard(api_key):
     if not client:
         return "Cliente não encontrado", 404
 
-    posts, other_comments = get_client_posts_with_comments(client["id"])
-    sentiment_counts = {"POSITIVO": 0, "NEUTRO": 0, "NEGATIVO": 0}
-    for p in posts:
-        for c in p["comments"]:
-            if c["sentiment"] in sentiment_counts:
-                sentiment_counts[c["sentiment"]] += 1
-    for c in other_comments:
-        if c["sentiment"] in sentiment_counts:
-            sentiment_counts[c["sentiment"]] += 1
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = int(request.args.get("per_page", 10))
+    except (TypeError, ValueError):
+        per_page = 10
+
+    data = get_client_posts_with_comments(client["id"], page=page, per_page=per_page)
+    sentiment_counts = get_client_sentiment_counts(client["id"])
 
     content = render_template_string(CLIENT_DASHBOARD_TEMPLATE,
         client=client,
-        posts=posts,
-        other_comments=other_comments,
-        sentiment_counts=sentiment_counts
+        posts=data["posts"],
+        other_comments=data["others"],
+        sentiment_counts=sentiment_counts,
+        total_posts=data["total_posts"],
+        total_pages=data["total_pages"],
+        page=data["page"],
+        per_page=data["per_page"]
     )
     return render_template_string(BASE_TEMPLATE, content=content)
 
