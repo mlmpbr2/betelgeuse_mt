@@ -983,7 +983,11 @@ CLIENT_DASHBOARD_TEMPLATE = """
             <div class="stat-label">😠 Negativos</div>
         </div>
         <div class="stat-box">
-            <div class="stat-value">R$ {{ "%.2f"|format(client.total_cost_brl) }}</div>
+            {% if client.paid_analysis_count and client.paid_analysis_count > 0 %}
+            <div class="stat-value">R$ {{ "%.2f"|format(client.total_cost_brl|default(0)) }}</div>
+            {% else %}
+            <div class="stat-value">R$ 0,00</div>
+            {% endif %}
             <div class="stat-label">💰 Custo Total</div>
         </div>
     </div>
@@ -1717,6 +1721,79 @@ def webhook_receive():
     except Exception as e:
         print(f"Erro processando webhook: {e}")
         return "Erro", 500
+
+
+
+# =============================================================================
+# DEBUG ENDPOINTS (diagnóstico rápido — remover em produção)
+# =============================================================================
+
+@app.route("/debug/db")
+def debug_db():
+    """Diagnóstico: mostra host do banco e últimos comentários."""
+    import urllib.parse
+    result = {"status": "ok", "db_host": None, "connected": False, "last_comments": [], "error": None}
+
+    try:
+        # Extrai host da URL sem expor senha
+        if SUPABASE_DB_URL:
+            parsed = urllib.parse.urlparse(SUPABASE_DB_URL)
+            result["db_host"] = parsed.hostname
+
+        conn = get_db_connection()
+        result["connected"] = True
+
+        with conn.cursor() as cur:
+            # Total de comentários
+            cur.execute("SELECT COUNT(*) FROM comments")
+            result["total_comments"] = cur.fetchone()[0]
+
+            # Últimos 10 comentários (qualquer cliente)
+            cur.execute("""
+                SELECT client_id, comment_id, post_id, message, sentiment, created_time, source
+                FROM comments
+                ORDER BY created_time DESC
+                LIMIT 10
+            """)
+            for row in cur.fetchall():
+                result["last_comments"].append({
+                    "client_id": row[0],
+                    "comment_id": row[1],
+                    "post_id": row[2],
+                    "message": row[3][:80] if row[3] else None,
+                    "sentiment": row[4],
+                    "created_time": row[5].isoformat() if row[5] else None,
+                    "source": row[6]
+                })
+
+            # Lista de clientes
+            cur.execute("SELECT id, name, page_name, page_id FROM clients ORDER BY id")
+            result["clients"] = [{"id": r[0], "name": r[1], "page_name": r[2], "page_id": r[3]} for r in cur.fetchall()]
+
+        conn.close()
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    return jsonify(result)
+
+
+@app.route("/debug/webhook")
+def debug_webhook():
+    """Diagnóstico: mostra os últimos eventos webhook recebidos (memória)."""
+    logs = []
+    for event in reversed(_WEBHOOK_EVENTS):
+        info = extract_webhook_comment_info(event)
+        if info:
+            logs.append({
+                "received_at": event["received_at"],
+                "page_id": info["page_id"],
+                "item": info["item"],
+                "verb": info["verb"],
+                "comment_id": info["comment_id"],
+                "message": info["message"][:60] if info["message"] else None
+            })
+    return jsonify({"webhook_events_in_memory": len(_WEBHOOK_EVENTS), "logs": logs})
 
 
 # =============================================================================
