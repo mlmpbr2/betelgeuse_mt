@@ -1809,5 +1809,57 @@ def reanalyze_comments(client_id):
 # MAIN (Vercel não usa isso, mas útil para teste local)
 # =============================================================================
 
+
+
+# =============================================================================
+# DEBUG ENDPOINTS (remover em producao)
+# =============================================================================
+
+@app.route("/debug/db")
+def debug_db():
+    import urllib.parse
+    result = {"status": "ok", "db_host": None, "connected": False, "last_comments": [], "clients": [], "error": None}
+    try:
+        if SUPABASE_DB_URL:
+            parsed = urllib.parse.urlparse(SUPABASE_DB_URL)
+            result["db_host"] = parsed.hostname
+        conn = get_db_connection()
+        result["connected"] = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM comments")
+            result["total_comments"] = cur.fetchone()[0]
+            cur.execute("SELECT client_id, comment_id, post_id, message, sentiment, created_time, source FROM comments ORDER BY created_time DESC LIMIT 10")
+            for row in cur.fetchall():
+                result["last_comments"].append({
+                    "client_id": row[0], "comment_id": row[1], "post_id": row[2],
+                    "message": row[3][:80] if row[3] else None,
+                    "sentiment": row[4], "created_time": row[5].isoformat() if row[5] else None,
+                    "source": row[6]
+                })
+            cur.execute("SELECT id, name, page_name, page_id FROM clients ORDER BY id")
+            result["clients"] = [{"id": r[0], "name": r[1], "page_name": r[2], "page_id": r[3]} for r in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+    return jsonify(result)
+
+@app.route("/debug/webhook")
+def debug_webhook():
+    logs = []
+    for event in reversed(_WEBHOOK_EVENTS):
+        info = extract_webhook_comment_info(event)
+        if info:
+            logs.append({
+                "received_at": event["received_at"],
+                "page_id": info["page_id"],
+                "item": info["item"],
+                "verb": info["verb"],
+                "comment_id": info["comment_id"],
+                "message": info["message"][:60] if info["message"] else None
+            })
+    return jsonify({"webhook_events_in_memory": len(_WEBHOOK_EVENTS), "logs": logs})
+
+
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
