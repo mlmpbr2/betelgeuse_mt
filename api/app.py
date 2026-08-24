@@ -166,6 +166,23 @@ def get_client_by_api_key(api_key):
     finally:
         conn.close()
 
+
+
+def subscribe_page_webhook(page_id, page_token):
+    try:
+        url = f"{FB_BASE_URL}/{page_id}/subscribed_apps"
+        params = {
+            "access_token": page_token,
+            "subscribed_fields": "feed"
+        }
+        resp = requests.post(url, params=params, timeout=30)
+        data = resp.json()
+        print(f"[WEBHOOK-SUBSCRIBE] Page {page_id}: {data}")
+        return data
+    except Exception as e:
+        print(f"[WEBHOOK-SUBSCRIBE] Error: {e}")
+        return {"error": str(e)}
+
 def save_client(name, email, page_id, page_name, access_token, n8n_webhook_url=""):
     """Salva novo cliente no Supabase. Ao reconectar (conflito no page_id),
     mantém a api_key existente para não invalidar o acesso do cliente."""
@@ -1314,6 +1331,9 @@ def callback():
             print(f"[FIRST-IMPORT] Erro em {page_name} (não bloqueia): {e}")
             import_info = None
 
+        # Inscreve pagina no webhook automaticamente
+        subscribe_page_webhook(page_id, page_token)
+        
         connected_pages.append({
             "page_name": page_name,
             "page_id": page_id,
@@ -1871,6 +1891,24 @@ def debug_config():
         "webhook_verify_token": WEBHOOK_VERIFY_TOKEN or "NOT_SET",
         "cost_per_comment_brl": COST_PER_COMMENT_BRL,
         "free_analysis_limit": FREE_ANALYSIS_LIMIT
+    })
+
+
+
+@app.route("/resubscribe/<api_key>")
+def resubscribe_webhook(api_key):
+    client = get_client_by_api_key(api_key)
+    if not client:
+        return "Cliente nao encontrado", 404
+    access_token = decrypt_token(client["access_token_encrypted"])
+    if not access_token:
+        return "Token nao descriptografado", 500
+    result = subscribe_page_webhook(client["page_id"], access_token)
+    return jsonify({
+        "client_id": client["id"],
+        "page_name": client["page_name"],
+        "page_id": client["page_id"],
+        "subscribe_result": result
     })
 
 if __name__ == "__main__":
