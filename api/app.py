@@ -1861,5 +1861,17 @@ def debug_webhook():
     return jsonify({"webhook_events_in_memory": len(_WEBHOOK_EVENTS), "logs": logs})
 
 
+
+@app.route("/debug/config")
+def debug_config():
+    return jsonify({
+        "fb_app_id": FB_APP_ID or "NOT_SET",
+        "fb_api_version": FB_API_VERSION,
+        "redirect_uri": REDIRECT_URI,
+        "webhook_verify_token": WEBHOOK_VERIFY_TOKEN or "NOT_SET",
+        "cost_per_comment_brl": COST_PER_COMMENT_BRL,
+        "free_analysis_limit": FREE_ANALYSIS_LIMIT
+    })
+
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
