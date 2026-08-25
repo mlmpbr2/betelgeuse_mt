@@ -12,7 +12,6 @@ import base64
 import hashlib
 import hmac
 import requests
-import threading
 import psycopg2
 from datetime import datetime, timedelta
 from collections import deque
@@ -167,9 +166,8 @@ def get_client_by_api_key(api_key):
     finally:
         conn.close()
 
-
-
 def subscribe_page_webhook(page_id, page_token):
+    """Inscreve a pagina no webhook de feed (comentarios)."""
     try:
         url = f"{FB_BASE_URL}/{page_id}/subscribed_apps"
         params = {
@@ -181,8 +179,9 @@ def subscribe_page_webhook(page_id, page_token):
         print(f"[WEBHOOK-SUBSCRIBE] Page {page_id}: {data}")
         return data
     except Exception as e:
-        print(f"[WEBHOOK-SUBSCRIBE] Error: {e}")
+        print(f"[WEBHOOK-SUBSCRIBE] Error for {page_id}: {e}")
         return {"error": str(e)}
+
 
 def save_client(name, email, page_id, page_name, access_token, n8n_webhook_url=""):
     """Salva novo cliente no Supabase. Ao reconectar (conflito no page_id),
@@ -804,9 +803,17 @@ def analyze_and_update_comments(client_id, new_comments):
 # =============================================================================
 
 def verify_signature(payload_body, signature_header):
-    # DEBUG: aceita qualquer assinatura (temporário)
-    print(f"[WEBHOOK-DEBUG] Signature header: {signature_header[:50] if signature_header else 'NONE'}")
-    return True
+    if not WEBHOOK_APP_SECRET:
+        return True
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(
+        WEBHOOK_APP_SECRET.encode("utf-8"),
+        payload_body,
+        hashlib.sha256
+    ).hexdigest()
+    received = signature_header.split("sha256=", 1)[1]
+    return hmac.compare_digest(expected, received)
 
 
 def extract_webhook_comment_info(payload):
@@ -1334,7 +1341,7 @@ def callback():
 
         # Inscreve pagina no webhook automaticamente
         subscribe_page_webhook(page_id, page_token)
-        
+
         connected_pages.append({
             "page_name": page_name,
             "page_id": page_id,
@@ -1673,88 +1680,62 @@ def webhook_verify():
     return "Verificação falhou", 403
 
 
-def process_webhook_payload(payload):
-    """Processamento pesado do webhook (Gemini + Supabase + N8N).
-
-    Roda em thread separada: a Meta exige resposta 200 rápida; respostas
-    lentas fazem a Meta enfileirar retries com backoff, o que causa o
-    delay perceptível na entrega dos eventos seguintes.
-    """
-    info = extract_webhook_comment_info(payload)
-    if not info or info["item"] != "comment" or info["verb"] != "add":
-        return
-
-    try:
-        # Busca cliente pelo page_id
-        client = get_client_by_page_id(info["page_id"])
-        if not client:
-            return
-
-        # Analisa sentimento só se houver saldo na cota freemium;
-        # sem saldo, salva com sentiment NULL (custo 0, recuperável depois)
-        has_quota = can_analyze_comment(client["id"])
-        sentiment = analyze_sentiment(info["message"]) if has_quota else None
-
-        # Salva comentário
-        save_comment(
-            client["id"],
-            info["comment_id"],
-            info["post_id"],
-            info["author_name"],
-            info["message"],
-            sentiment,
-            0,  # like_count não vem no webhook
-            info["created_time"],
-            "webhook"
-        )
-
-        # Atualiza stats (custo só quando houve análise)
-        update_client_stats(client["id"], 1,
-                            COST_PER_COMMENT_BRL if has_quota else 0.0)
-
-        # Envia para N8N
-        if client["n8n_webhook_url"]:
-            try:
-                requests.post(client["n8n_webhook_url"], json={
-                    "client_id": client["id"],
-                    "page_name": client["page_name"],
-                    "event": "new_comment",
-                    "comment": info,
-                    "sentiment": sentiment,
-                    "quota_exceeded": not has_quota,
-                    "timestamp": datetime.now().isoformat()
-                }, timeout=10)
-            except Exception as e:
-                print(f"Erro ao enviar webhook para N8N: {e}")
-    except Exception as e:
-        print(f"Erro no processamento async do webhook: {e}")
-
-
 @app.route("/webhook", methods=["POST"])
 def webhook_receive():
     signature = request.headers.get("X-Hub-Signature-256", "")
     payload_body = request.get_data()
-
-    print(f"[WEBHOOK-DEBUG] POST recebido. Signature: {signature[:50] if signature else 'NONE'}")
-    print(f"[WEBHOOK-DEBUG] Body size: {len(payload_body)} bytes")
-
     if not verify_signature(payload_body, signature):
-        print("[WEBHOOK-DEBUG] Assinatura falhou (mas debug=True, aceitando)")
-        # DEBUG: continua mesmo com assinatura inválida
+        return "Assinatura inválida", 403
 
     try:
         payload = request.get_json()
-        print(f"[WEBHOOK-DEBUG] Payload parsed: {json.dumps(payload)[:500]}")
-
         _WEBHOOK_EVENTS.append({
             "received_at": datetime.now().isoformat(),
             "payload": payload
         })
 
-        # ACK imediato para a Meta; processamento pesado em background
-        threading.Thread(
-            target=process_webhook_payload, args=(payload,), daemon=True
-        ).start()
+        # Extrai info do comentário
+        info = extract_webhook_comment_info(payload)
+        if info and info["item"] == "comment" and info["verb"] == "add":
+            # Busca cliente pelo page_id
+            client = get_client_by_page_id(info["page_id"])
+            if client:
+                # Analisa sentimento só se houver saldo na cota freemium;
+                # sem saldo, salva com sentiment NULL (custo 0, recuperável depois)
+                has_quota = can_analyze_comment(client["id"])
+                sentiment = analyze_sentiment(info["message"]) if has_quota else None
+
+                # Salva comentário
+                save_comment(
+                    client["id"], 
+                    info["comment_id"], 
+                    info["post_id"],
+                    info["author_name"], 
+                    info["message"], 
+                    sentiment,
+                    0,  # like_count não vem no webhook
+                    info["created_time"],
+                    "webhook"
+                )
+
+                # Atualiza stats (custo só quando houve análise)
+                update_client_stats(client["id"], 1,
+                                    COST_PER_COMMENT_BRL if has_quota else 0.0)
+
+                # Envia para N8N
+                if client["n8n_webhook_url"]:
+                    try:
+                        requests.post(client["n8n_webhook_url"], json={
+                            "client_id": client["id"],
+                            "page_name": client["page_name"],
+                            "event": "new_comment",
+                            "comment": info,
+                            "sentiment": sentiment,
+                            "quota_exceeded": not has_quota,
+                            "timestamp": datetime.now().isoformat()
+                        }, timeout=10)
+                    except Exception as e:
+                        print(f"Erro ao enviar webhook para N8N: {e}")
 
         return "EVENT_RECEIVED", 200
     except Exception as e:
@@ -1850,79 +1831,17 @@ def reanalyze_comments(client_id):
 # =============================================================================
 
 
-
-# =============================================================================
-# DEBUG ENDPOINTS (remover em producao)
-# =============================================================================
-
-@app.route("/debug/db")
-def debug_db():
-    import urllib.parse
-    result = {"status": "ok", "db_host": None, "connected": False, "last_comments": [], "clients": [], "error": None}
-    try:
-        if SUPABASE_DB_URL:
-            parsed = urllib.parse.urlparse(SUPABASE_DB_URL)
-            result["db_host"] = parsed.hostname
-        conn = get_db_connection()
-        result["connected"] = True
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM comments")
-            result["total_comments"] = cur.fetchone()[0]
-            cur.execute("SELECT client_id, comment_id, post_id, message, sentiment, created_time, source FROM comments ORDER BY created_time DESC LIMIT 10")
-            for row in cur.fetchall():
-                result["last_comments"].append({
-                    "client_id": row[0], "comment_id": row[1], "post_id": row[2],
-                    "message": row[3][:80] if row[3] else None,
-                    "sentiment": row[4], "created_time": row[5].isoformat() if row[5] else None,
-                    "source": row[6]
-                })
-            cur.execute("SELECT id, name, page_name, page_id FROM clients ORDER BY id")
-            result["clients"] = [{"id": r[0], "name": r[1], "page_name": r[2], "page_id": r[3]} for r in cur.fetchall()]
-        conn.close()
-    except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
-    return jsonify(result)
-
-@app.route("/debug/webhook")
-def debug_webhook():
-    logs = []
-    for event in reversed(_WEBHOOK_EVENTS):
-        info = extract_webhook_comment_info(event)
-        if info:
-            logs.append({
-                "received_at": event["received_at"],
-                "page_id": info["page_id"],
-                "item": info["item"],
-                "verb": info["verb"],
-                "comment_id": info["comment_id"],
-                "message": info["message"][:60] if info["message"] else None
-            })
-    return jsonify({"webhook_events_in_memory": len(_WEBHOOK_EVENTS), "logs": logs})
-
-
-
-@app.route("/debug/config")
-def debug_config():
-    return jsonify({
-        "fb_app_id": FB_APP_ID or "NOT_SET",
-        "fb_api_version": FB_API_VERSION,
-        "redirect_uri": REDIRECT_URI,
-        "webhook_verify_token": WEBHOOK_VERIFY_TOKEN or "NOT_SET",
-        "cost_per_comment_brl": COST_PER_COMMENT_BRL,
-        "free_analysis_limit": FREE_ANALYSIS_LIMIT
-    })
-
-
-
 @app.route("/resubscribe/<api_key>")
 def resubscribe_webhook(api_key):
+    """Forca re-inscricao da pagina no webhook (para atualizar URL)."""
     client = get_client_by_api_key(api_key)
     if not client:
         return "Cliente nao encontrado", 404
+
     access_token = decrypt_token(client["access_token_encrypted"])
     if not access_token:
         return "Token nao descriptografado", 500
+
     result = subscribe_page_webhook(client["page_id"], access_token)
     return jsonify({
         "client_id": client["id"],
@@ -1930,66 +1849,6 @@ def resubscribe_webhook(api_key):
         "page_id": client["page_id"],
         "subscribe_result": result
     })
-
-@app.route("/debug/meta/<api_key>")
-def debug_meta(api_key):
-    """Diagnóstico Meta: verifica token, inscrição da página e inscrição do app.
-
-    Responde as 3 perguntas que decidem se o webhook PODE ser entregue:
-    1. O page token salvo tem os scopes certos? (debug_token)
-    2. A página está inscrita no app? (GET /{page_id}/subscribed_apps)
-    3. O app tem assinatura ativa do objeto 'page' com campo 'feed'? (GET /{app_id}/subscriptions)
-    """
-    client = get_client_by_api_key(api_key)
-    if not client:
-        return "Cliente nao encontrado", 404
-    access_token = decrypt_token(client["access_token_encrypted"])
-    if not access_token:
-        return "Token nao descriptografado", 500
-
-    result = {"client_id": client["id"], "page_id": client["page_id"],
-              "page_name": client["page_name"]}
-
-    # 1. Scopes reais do token salvo
-    try:
-        resp = requests.get(
-            f"{FB_BASE_URL}/debug_token",
-            params={"input_token": access_token,
-                    "access_token": f"{FB_APP_ID}|{FB_APP_SECRET}"},
-            timeout=30)
-        td = resp.json().get("data", {})
-        result["token_debug"] = {
-            "is_valid": td.get("is_valid"),
-            "app_id": td.get("app_id"),
-            "type": td.get("type"),
-            "expires_at": td.get("expires_at"),
-            "scopes": td.get("scopes", []),
-            "granular_scopes": td.get("granular_scopes", []),
-        }
-    except Exception as e:
-        result["token_debug"] = {"error": str(e)}
-
-    # 2. Inscrição da página neste app
-    try:
-        resp = requests.get(
-            f"{FB_BASE_URL}/{client['page_id']}/subscribed_apps",
-            params={"access_token": access_token}, timeout=30)
-        result["page_subscribed_apps"] = resp.json()
-    except Exception as e:
-        result["page_subscribed_apps"] = {"error": str(e)}
-
-    # 3. Assinatura no nível do app (callback URL + campos + status)
-    try:
-        resp = requests.get(
-            f"{FB_BASE_URL}/{FB_APP_ID}/subscriptions",
-            params={"access_token": f"{FB_APP_ID}|{FB_APP_SECRET}"},
-            timeout=30)
-        result["app_subscriptions"] = resp.json()
-    except Exception as e:
-        result["app_subscriptions"] = {"error": str(e)}
-
-    return jsonify(result)
-
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
