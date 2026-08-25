@@ -1,7 +1,7 @@
 """
 Betelgeuse TI - Multitenant API
 Flask app para Vercel - Cada cliente conecta sua própria página do Facebook
-Versão: 2026-08-19 - Dashboard por post, primeira importação e billing transparente
+Versão: 2026-08-25 - Fix login em aba normal (PRG + state no OAuth) e hardening de config
 """
 
 import os
@@ -11,13 +11,14 @@ import math
 import base64
 import hashlib
 import hmac
+import secrets
 import requests
 import psycopg2
 from datetime import datetime, timedelta
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from cryptography.fernet import Fernet
-from flask import Flask, redirect, request, session, render_template_string, url_for, jsonify
+from flask import Flask, redirect, request, session, render_template_string, url_for, jsonify, make_response
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-key-change-in-prod")
@@ -41,30 +42,53 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_M
 
 # Criptografia
 ENCRYPTION_KEY = os.environ.get("TOKEN_SECRET", "")
+fernet = None
 if ENCRYPTION_KEY:
-    # Garantir que a chave seja válida para Fernet (32 bytes, base64)
-    key_bytes = ENCRYPTION_KEY.encode()[:32].ljust(32, b'0')
-    FERNET_KEY = base64.urlsafe_b64encode(key_bytes)
-    fernet = Fernet(FERNET_KEY)
-else:
-    fernet = None
+    try:
+        # Garantir que a chave seja válida para Fernet (32 bytes, base64)
+        key_bytes = ENCRYPTION_KEY.encode()[:32].ljust(32, b'0')
+        FERNET_KEY = base64.urlsafe_b64encode(key_bytes)
+        fernet = Fernet(FERNET_KEY)
+    except Exception as e:
+        # TOKEN_SECRET ruim não pode derrubar o app inteiro (todas as rotas 500)
+        print(f"[CONFIG] TOKEN_SECRET invalida ({e}) — tokens NAO serao criptografados")
+        fernet = None
 
 # Webhook
 WEBHOOK_VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", "betelgeuse_webhook_2026")
 WEBHOOK_APP_SECRET = FB_APP_SECRET
 
-# Billing
-cost_env = os.environ.get("COST_PER_COMMENT_BRL", "0.20")
-COST_PER_COMMENT_BRL = float(cost_env) if cost_env and cost_env.strip() else 0.20
+def _env_float(name, default):
+    """Lê float de env var sem derrubar o app se o valor for inválido."""
+    try:
+        return float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        print(f"[CONFIG] {name} invalida, usando default {default}")
+        return default
 
-# Primeira importação no /callback: limites menores para não travar o login.
-# O histórico completo é processado nos ciclos de polling seguintes (N8N).
-FIRST_IMPORT_MAX_POSTS = int(os.environ.get("FIRST_IMPORT_MAX_POSTS", "3"))
-FIRST_IMPORT_MAX_COMMENTS = int(os.environ.get("FIRST_IMPORT_MAX_COMMENTS", "50"))
+
+def _env_int(name, default):
+    """Lê int de env var sem derrubar o app se o valor for inválido."""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        print(f"[CONFIG] {name} invalida, usando default {default}")
+        return default
+
+
+# Billing
+COST_PER_COMMENT_BRL = _env_float("COST_PER_COMMENT_BRL", 0.20)
+
+# Primeira importação no /callback: DESLIGADA por default para não estourar o
+# timeout da Vercel e travar o login. A sincronização acontece nos ciclos de
+# polling do N8N. Ative com FIRST_IMPORT_ON_LOGIN=true se quiser importar no login.
+FIRST_IMPORT_ON_LOGIN = os.environ.get("FIRST_IMPORT_ON_LOGIN", "false").strip().lower() == "true"
+FIRST_IMPORT_MAX_POSTS = _env_int("FIRST_IMPORT_MAX_POSTS", 3)
+FIRST_IMPORT_MAX_COMMENTS = _env_int("FIRST_IMPORT_MAX_COMMENTS", 50)
 
 # Freemium: análises gratuitas por cliente (além delas, só com créditos pagos).
 # Requer: ALTER TABLE clients ADD COLUMN IF NOT EXISTS paid_analysis_count INTEGER DEFAULT 0;
-FREE_ANALYSIS_LIMIT = int(os.environ.get("FREE_ANALYSIS_LIMIT", "50"))
+FREE_ANALYSIS_LIMIT = _env_int("FREE_ANALYSIS_LIMIT", 50)
 
 # Admin (relatório diário para o N8N)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
@@ -1243,7 +1267,9 @@ BILLING_TEMPLATE = """
 # =============================================================================
 
 def nocache(response):
-    """Adiciona headers anti-cache para evitar navegador/CDN cachear paginas."""
+    """Adiciona headers anti-cache para evitar navegador/CDN cachear paginas.
+    Aceita str ou Response (make_response garante o objeto Response)."""
+    response = make_response(response)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -1258,15 +1284,67 @@ def home():
 @app.route("/login")
 def login():
     scopes = "pages_show_list,pages_read_engagement,pages_read_user_content,pages_manage_metadata"
+    # state protege contra CSRF e amarra o callback a esta sessão
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
     auth_url = (
         f"https://www.facebook.com/{FB_API_VERSION}/dialog/oauth"
         f"?client_id={FB_APP_ID}"
         f"&redirect_uri={REDIRECT_URI}"
         f"&scope={scopes}"
         f"&response_type=code"
-        f"&auth_type=reauthenticate"  # ← Seletor de Pg.
+        f"&state={state}"
     )
     return redirect(auth_url)
+
+
+def build_success_content(connected_pages):
+    """Monta o HTML da tela de sucesso a partir das páginas conectadas."""
+    content = f"""
+    <div class="card" style="text-align: center;">
+        <div class="alert alert-success">
+            ✅ <strong>{len(connected_pages)} página(s) conectada(s) com sucesso!</strong>
+        </div>
+    </div>
+    """
+    for p in connected_pages:
+        if p.get("import_info"):
+            import_html = f"""
+            <div style="background: #e3f2fd; border-radius: 8px; padding: 12px; margin: 12px 0;">
+                📥 <strong>Sincronização inicial:</strong> {p['import_info']['comments_new']} comentários importados de {p['import_info']['posts_checked']} posts — custo: R$ {p['import_info']['cost_brl']:.2f}<br>
+                <span style="font-size: 12px; color: #1565c0;">Esta é uma importação inicial parcial. O histórico completo é processado automaticamente nos próximos ciclos (a cada hora).</span>
+            </div>
+            """
+        else:
+            import_html = """
+            <div style="background: #e3f2fd; border-radius: 8px; padding: 12px; margin: 12px 0;">
+                🔄 <strong>Sincronização automática ativa</strong> — os comentários serão processados automaticamente nos próximos ciclos (a cada hora).
+            </div>
+            """
+        content += f"""
+        <div class="card" style="margin-bottom: 16px;">
+            <h3>📄 {p['page_name']}</h3>
+            <p style="color: #65676b; font-size: 13px;">Page ID: {p['page_id']}</p>
+            {import_html}
+            <div style="background: #1a1a2e; color: white; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 13px; margin: 12px 0;">
+                🔑 API Key: {p['api_key']}
+            </div>
+            <a href="/client/{p['api_key']}/dashboard" class="btn btn-primary">📊 Ver Dashboard</a>
+        </div>
+        """
+    return content
+
+
+@app.route("/success")
+def success():
+    """Tela de sucesso pós-login. Idempotente: renderiza a partir da sessão,
+    então refresh e botão voltar NUNCA reexecutam a troca do code — era isso
+    que causava 'This authorization code has been used' em aba normal."""
+    connected_pages = session.get("connected_pages")
+    if not connected_pages:
+        return redirect("/")
+    return nocache(render_template_string(
+        BASE_TEMPLATE, content=build_success_content(connected_pages)))
 
 
 @app.route("/callback")
@@ -1278,11 +1356,21 @@ def callback():
     # Se houve erro no OAuth (usuario cancelou, permissao negada, etc.)
     if error:
         print(f"[OAUTH] Erro: {error} - {error_reason}")
-        session.clear()
+        session.pop("oauth_state", None)
         return redirect("/")
 
     if not code:
         return "Erro: Código não fornecido", 400
+
+    # Valida state (anti-CSRF) quando ambos existem. Se a sessão se perdeu
+    # (ex.: replay de callback antigo), não falhamos aqui — o code usado é
+    # tratado abaixo com redirect amigável.
+    expected_state = session.pop("oauth_state", None)
+    received_state = request.args.get("state")
+    if expected_state and received_state and not hmac.compare_digest(expected_state, received_state):
+        print("[OAUTH] State divergente — reiniciando fluxo de login.")
+        session.clear()
+        return redirect("/login")
 
     # Troca code por token
     token_url = f"{FB_BASE_URL}/oauth/access_token"
@@ -1296,12 +1384,15 @@ def callback():
         resp = requests.get(token_url, params=params, timeout=30)
         data = resp.json()
 
-        # Tratar erro especifico "code has been used"
+        # "code has been used" acontece quando o navegador reenvia o callback
+        # (back/refresh/retry) — comum em aba normal. Se o login já foi
+        # concluído nesta sessão, mandamos para /success em vez de erro.
         if "error" in data:
             error_msg = data.get("error", {}).get("message", "")
             if "has been used" in error_msg.lower() or "expired" in error_msg.lower():
-                print(f"[OAUTH] Code ja usado ou expirado. Redirecionando para login.")
-                session.clear()
+                print(f"[OAUTH] Code ja usado ou expirado.")
+                if session.get("connected_pages"):
+                    return redirect("/success")
                 return redirect("/login")
             return f"Erro na autenticação: {data}", 400
 
@@ -1309,6 +1400,21 @@ def callback():
             return f"Erro na autenticação: {data}", 400
 
         user_token = data["access_token"]
+
+        # Troca por token longo (~60 dias) para os page tokens durarem mais.
+        # Se falhar, segue com o token curto (não bloqueia o login).
+        try:
+            ll_resp = requests.get(token_url, params={
+                "grant_type": "fb_exchange_token",
+                "client_id": FB_APP_ID,
+                "client_secret": FB_APP_SECRET,
+                "fb_exchange_token": user_token
+            }, timeout=30)
+            ll_data = ll_resp.json()
+            if "access_token" in ll_data:
+                user_token = ll_data["access_token"]
+        except Exception as e:
+            print(f"[OAUTH] Falha ao estender token (segue com o curto): {e}")
 
         # Pega informações do usuário
         me_data = fb_get("me", {"fields": "id,name,email"}, user_token)
@@ -1332,7 +1438,7 @@ def callback():
                 </div>
             """)
 
-        # 🔄 Processa SÓ a primeira página com importação leve.
+        # 🔄 Processa SÓ a primeira página com importação leve (se habilitada).
         # As demais são salvas sem importação síncrona (evita timeout no login);
         # o N8N faz o polling delas nos ciclos seguintes (a cada hora).
         main_page = pages[0]
@@ -1340,7 +1446,7 @@ def callback():
 
         connected_pages = []
 
-        # === PRIMEIRA PÁGINA (com importação leve) ===
+        # === PRIMEIRA PÁGINA ===
         page_id = main_page["id"]
         page_name = main_page["name"]
         page_token = main_page.get("access_token", user_token)
@@ -1348,23 +1454,32 @@ def callback():
         # Salva no Supabase
         result = save_client(user_name, user_email, page_id, page_name, page_token)
 
-        # Primeira importação: baixa comentários históricos
+        # Primeira importação: só se FIRST_IMPORT_ON_LOGIN=true. Desligada por
+        # default para não estourar o timeout da Vercel — o histórico chega
+        # pelos ciclos de polling do N8N.
         import_info = None
-        try:
-            first_client = {
-                "id": result["id"], "page_id": page_id,
-                "page_name": page_name, "n8n_webhook_url": ""
-            }
-            import_info = run_poll_for_client(
-                first_client, page_token,
-                triggered_by="first_import", source="first_import",
-                max_posts=FIRST_IMPORT_MAX_POSTS,
-                max_comments=FIRST_IMPORT_MAX_COMMENTS
-            )
-            mark_first_import(result["id"], import_info["comments_new"])
-        except Exception as e:
-            print(f"[FIRST-IMPORT] Erro em {page_name} (não bloqueia): {e}")
-            import_info = None
+        if FIRST_IMPORT_ON_LOGIN:
+            try:
+                first_client = {
+                    "id": result["id"], "page_id": page_id,
+                    "page_name": page_name, "n8n_webhook_url": ""
+                }
+                full_import_info = run_poll_for_client(
+                    first_client, page_token,
+                    triggered_by="first_import", source="first_import",
+                    max_posts=FIRST_IMPORT_MAX_POSTS,
+                    max_comments=FIRST_IMPORT_MAX_COMMENTS
+                )
+                mark_first_import(result["id"], full_import_info["comments_new"])
+                # Guarda na sessão só o necessário para renderizar /success
+                import_info = {
+                    "comments_new": full_import_info["comments_new"],
+                    "posts_checked": full_import_info["posts_checked"],
+                    "cost_brl": full_import_info["cost_brl"]
+                }
+            except Exception as e:
+                print(f"[FIRST-IMPORT] Erro em {page_name} (não bloqueia): {e}")
+                import_info = None
 
         # Inscreve pagina no webhook automaticamente
         subscribe_page_webhook(page_id, page_token)
@@ -1389,43 +1504,14 @@ def callback():
                 "import_info": None
             })
 
-        # Renderiza sucesso com TODAS as páginas
-        content = f"""
-        <div class="card" style="text-align: center;">
-            <div class="alert alert-success">
-                ✅ <strong>{len(connected_pages)} página(s) conectada(s) com sucesso!</strong>
-            </div>
-        </div>
-        """
-        for p in connected_pages:
-            if p["import_info"]:
-                import_html = f"""
-                <div style="background: #e3f2fd; border-radius: 8px; padding: 12px; margin: 12px 0;">
-                    📥 <strong>Sincronização inicial:</strong> {p['import_info']['comments_new']} comentários importados de {p['import_info']['posts_checked']} posts — custo: R$ {p['import_info']['cost_brl']:.2f}<br>
-                    <span style="font-size: 12px; color: #1565c0;">Esta é uma importação inicial parcial. O histórico completo é processado automaticamente nos próximos ciclos (a cada hora).</span>
-                </div>
-                """
-            else:
-                import_html = """
-                <div style="background: #e3f2fd; border-radius: 8px; padding: 12px; margin: 12px 0;">
-                    🔄 <strong>Sincronização automática ativa</strong> — os comentários serão processados automaticamente nos próximos ciclos (a cada hora).
-                </div>
-                """
-            content += f"""
-            <div class="card" style="margin-bottom: 16px;">
-                <h3>📄 {p['page_name']}</h3>
-                <p style="color: #65676b; font-size: 13px;">Page ID: {p['page_id']}</p>
-                {import_html}
-                <div style="background: #1a1a2e; color: white; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 13px; margin: 12px 0;">
-                    🔑 API Key: {p['api_key']}
-                </div>
-                <a href="/client/{p['api_key']}/dashboard" class="btn btn-primary">📊 Ver Dashboard</a>
-            </div>
-            """
-        
-        return render_template_string(BASE_TEMPLATE, content=content)
+        # PRG: grava o resultado na sessão e redireciona. A URL /callback?code=...
+        # sai do histórico — refresh/voltar em /success apenas re-renderiza.
+        session["connected_pages"] = connected_pages
+        session.permanent = True
+        return redirect("/success", code=303)
 
     except Exception as e:
+        print(f"[OAUTH] Exceção no callback: {e}")
         return f"Erro: {str(e)}", 500
 
 @app.route("/client/<api_key>/dashboard")
@@ -1779,6 +1865,18 @@ def webhook_receive():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Loga o traceback completo nos logs da Vercel e retorna erro genérico
+    (sem vazar detalhes internos). HTTPException (404 etc.) passa direto."""
+    import traceback
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    traceback.print_exc()
+    return "Erro interno. Tente novamente em instantes.", 500
 
 
 @app.route("/webhook/logs")
