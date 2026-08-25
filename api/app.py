@@ -1802,6 +1802,128 @@ def poll_client(client_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/poll_comments")
+def poll_comments_n8n():
+    """Endpoint do workflow N8N: dispara o polling do cliente e responde no
+    contrato que os nodes Code do workflow antigo já consomem
+    (comentarios/sentimentos/percentuais/posts/alertas).
+    Auth: key = api_key do cliente (a mesma do dashboard). page_id é ignorado."""
+    api_key = request.args.get("key", "")
+    client = get_client_by_api_key(api_key)
+    if not client:
+        return jsonify({"status": "error", "error": "api_key invalida"}), 404
+
+    try:
+        limit = max(1, min(100, int(request.args.get("limit", 10))))
+    except (TypeError, ValueError):
+        limit = 10
+
+    empty_contract = {
+        "comentarios": [], "total_comentarios": 0, "total_posts": 0,
+        "sentimentos": {"POSITIVO": 0, "NEUTRO": 0, "NEGATIVO": 0},
+        "percentuais": {"positivo": 0, "neutro": 0, "negativo": 0},
+        "posts": [], "alertas": []
+    }
+    base = {"client_id": client["id"], "page_name": client["page_name"]}
+
+    access_token = decrypt_token(client["access_token_encrypted"])
+    if not access_token:
+        return jsonify({**empty_contract, **base, "status": "error",
+                        "error": "token nao descriptografado — reconecte via /login"})
+
+    # Dispara o polling (busca Graph API, salva, analisa sentimento)
+    poll_result = run_poll_for_client(client, access_token, triggered_by="n8n")
+    if poll_result.get("status") == "error":
+        return jsonify({**empty_contract, **base, "status": "error",
+                        "error": poll_result.get("error"), "poll": poll_result})
+
+    # Monta o contrato a partir do banco (resumo do dia, fuso America/Sao_Paulo)
+    dia = ("(c.created_time::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date"
+           " = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date")
+    conn = get_db_connection()
+    try:
+        set_rls_client(conn, client_id=client["id"])
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.comment_id, c.author_name, c.message, c.sentiment,
+                       c.like_count, COALESCE(LEFT(p.message, 80), c.post_id), c.created_time
+                FROM comments c
+                LEFT JOIN posts p ON p.client_id = c.client_id AND p.post_id = c.post_id
+                WHERE c.client_id = %s
+                ORDER BY c.created_time DESC LIMIT %s
+            """, (client["id"], limit))
+            comentarios = [{
+                "id": r[0], "author": r[1], "message": r[2], "sentiment": r[3],
+                "likes": r[4] or 0, "post_titulo": r[5] or "",
+                "created_time": _iso(r[6])
+            } for r in cur.fetchall()]
+
+            cur.execute(f"""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE c.sentiment = 'POSITIVO'),
+                       COUNT(*) FILTER (WHERE c.sentiment = 'NEUTRO'),
+                       COUNT(*) FILTER (WHERE c.sentiment = 'NEGATIVO')
+                FROM comments c WHERE c.client_id = %s AND {dia}
+            """, (client["id"],))
+            row = cur.fetchone()
+            total_hoje = row[0]
+            sentimentos = {"POSITIVO": row[1], "NEUTRO": row[2], "NEGATIVO": row[3]}
+
+            cur.execute(f"""
+                SELECT COUNT(DISTINCT c.post_id)
+                FROM comments c WHERE c.client_id = %s AND {dia}
+            """, (client["id"],))
+            total_posts_hoje = cur.fetchone()[0]
+
+            cur.execute(f"""
+                SELECT COALESCE(LEFT(p.message, 60), c.post_id),
+                       COUNT(*),
+                       COUNT(*) FILTER (WHERE c.sentiment = 'POSITIVO'),
+                       COUNT(*) FILTER (WHERE c.sentiment = 'NEUTRO'),
+                       COUNT(*) FILTER (WHERE c.sentiment = 'NEGATIVO')
+                FROM comments c
+                LEFT JOIN posts p ON p.client_id = c.client_id AND p.post_id = c.post_id
+                WHERE c.client_id = %s AND {dia}
+                GROUP BY 1 ORDER BY 2 DESC LIMIT 10
+            """, (client["id"],))
+            posts = [{
+                "titulo": r[0] or "", "total_comentarios": r[1],
+                "sentimentos": {"POSITIVO": r[2], "NEUTRO": r[3], "NEGATIVO": r[4]}
+            } for r in cur.fetchall()]
+
+            cur.execute(f"""
+                SELECT c.author_name, c.message FROM comments c
+                WHERE c.client_id = %s AND c.sentiment = 'NEGATIVO' AND {dia}
+                ORDER BY c.created_time DESC LIMIT 10
+            """, (client["id"],))
+            alertas = [{"author": r[0], "message": r[1]} for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[POLL_COMMENTS] Erro montando resumo: {e}")
+        return jsonify({**empty_contract, **base, "status": "error",
+                        "error": str(e), "poll": poll_result})
+    finally:
+        conn.close()
+
+    percentuais = {
+        "positivo": round(100 * sentimentos["POSITIVO"] / total_hoje) if total_hoje else 0,
+        "neutro": round(100 * sentimentos["NEUTRO"] / total_hoje) if total_hoje else 0,
+        "negativo": round(100 * sentimentos["NEGATIVO"] / total_hoje) if total_hoje else 0
+    }
+
+    return jsonify({
+        "status": "ok",
+        **base,
+        "poll": poll_result,
+        "comentarios": comentarios,
+        "total_comentarios": total_hoje,
+        "total_posts": total_posts_hoje,
+        "sentimentos": sentimentos,
+        "percentuais": percentuais,
+        "posts": posts,
+        "alertas": alertas
+    })
+
+
 # =============================================================================
 # WEBHOOK (Meta envia eventos em tempo real)
 # =============================================================================
