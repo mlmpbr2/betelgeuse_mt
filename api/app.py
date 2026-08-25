@@ -1242,6 +1242,17 @@ BILLING_TEMPLATE = """
 # FLASK ROUTES
 # =============================================================================
 
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def nocache(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 @app.route("/")
 def home():
     return render_template_string(BASE_TEMPLATE, content=HOME_TEMPLATE)
@@ -1396,7 +1407,8 @@ def callback():
             </div>
             """
         
-        return render_template_string(BASE_TEMPLATE, content=content)
+        response = render_template_string(BASE_TEMPLATE, content=content)
+    return nocache(response)
 
     except Exception as e:
         return f"Erro: {str(e)}", 500
@@ -1429,7 +1441,8 @@ def client_dashboard(api_key):
         page=data["page"],
         per_page=data["per_page"]
     )
-    return render_template_string(BASE_TEMPLATE, content=content)
+    response = render_template_string(BASE_TEMPLATE, content=content)
+    return nocache(response)
 
 
 MESES_PT = ["", "jan", "fev", "mar", "abr", "mai", "jun",
