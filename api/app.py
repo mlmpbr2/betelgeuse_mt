@@ -1272,6 +1272,15 @@ def login():
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
+    error = request.args.get("error")
+    error_reason = request.args.get("error_reason")
+
+    # Se houve erro no OAuth (usuario cancelou, permissao negada, etc.)
+    if error:
+        print(f"[OAUTH] Erro: {error} - {error_reason}")
+        session.clear()
+        return redirect("/")
+
     if not code:
         return "Erro: Código não fornecido", 400
 
@@ -1286,6 +1295,16 @@ def callback():
     try:
         resp = requests.get(token_url, params=params, timeout=30)
         data = resp.json()
+
+        # Tratar erro especifico "code has been used"
+        if "error" in data:
+            error_msg = data.get("error", {}).get("message", "")
+            if "has been used" in error_msg.lower() or "expired" in error_msg.lower():
+                print(f"[OAUTH] Code ja usado ou expirado. Redirecionando para login.")
+                session.clear()
+                return redirect("/login")
+            return f"Erro na autenticação: {data}", 400
+
         if "access_token" not in data:
             return f"Erro na autenticação: {data}", 400
 
