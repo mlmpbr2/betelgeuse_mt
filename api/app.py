@@ -253,7 +253,7 @@ def save_comment(client_id, comment_id, post_id, author_name, message, sentiment
             return row[0] if row else None
     except Exception as e:
         print(f"Error saving comment: {e}")
-        return None
+        return False  # False = erro real (None = duplicado ignorado pelo ON CONFLICT)
     finally:
         conn.close()
 
@@ -1639,6 +1639,24 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
     posts_data = fb_get(f"{client['page_id']}/posts",
                        {"fields": "id,message,created_time,permalink_url", "limit": max_posts},
                        access_token)
+
+    # Erro da Graph API (ex.: token expirado) virava lista vazia silenciosa —
+    # agora registramos no poll_logs e devolvemos erro explícito para o N8N.
+    if "error" in posts_data:
+        err = posts_data["error"]
+        err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        print(f"[POLL] Graph API erro no cliente {client['id']}: {err_msg}")
+        save_poll_log(client["id"], 0, 0, 0, 0, 0.0,
+                      f"graph_api: {err_msg}", triggered_by)
+        return {
+            "status": "error",
+            "client_id": client["id"],
+            "page_name": client["page_name"],
+            "error": err_msg,
+            "triggered_by": triggered_by,
+            "timestamp": datetime.now().isoformat()
+        }
+
     posts = posts_data.get("data", [])
 
     # Upsert dos posts (para agrupar comentários no dashboard)
@@ -1650,6 +1668,7 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
     comments_found = 0
     comments_new_count = 0
     comments_analyzed = 0
+    comments_save_errors = 0
     sentiments = []
 
     for post in posts:
@@ -1680,7 +1699,9 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
                 message, None, like_count, created_time, source
             )
 
-            if saved_id:
+            if saved_id is False:
+                comments_save_errors += 1
+            elif saved_id:
                 comments_new_count += 1
                 new_comments.append({
                     "id": comment_id, "message": message,
@@ -1730,6 +1751,7 @@ def run_poll_for_client(client, access_token, triggered_by="n8n", source="pollin
         "comments_new": comments_new_count,
         "comments_analyzed": comments_analyzed,
         "comments_skipped_quota": comments_skipped_quota,
+        "comments_save_errors": comments_save_errors,
         "quota": {
             "analyzed": quota["analyzed"] + comments_analyzed,
             "free_limit": quota["free_limit"],
@@ -1838,7 +1860,7 @@ def webhook_receive():
                                     COST_PER_COMMENT_BRL if has_quota else 0.0)
 
                 # Envia para N8N
-                if client["n8n_webhook_url"]:
+                if client.get("n8n_webhook_url"):
                     try:
                         requests.post(client["n8n_webhook_url"], json={
                             "client_id": client["id"],
@@ -1976,6 +1998,192 @@ def resubscribe_webhook(api_key):
         "page_id": client["page_id"],
         "subscribe_result": result
     })
+
+
+# =============================================================================
+# DEBUG (protegido por ADMIN_API_KEY — diagnostica pipeline de comentários)
+# =============================================================================
+
+def check_admin_key():
+    """None se autorizado; caso contrário, resposta de erro pronta."""
+    if not ADMIN_API_KEY:
+        return jsonify({"error": "ADMIN_API_KEY nao configurada no servidor"}), 503
+    key = request.args.get("key", "")
+    if not key or not hmac.compare_digest(key, ADMIN_API_KEY):
+        return jsonify({"error": "Nao autorizado"}), 403
+    return None
+
+
+def _iso(v):
+    """Serializa datetime/str/None para JSON."""
+    if v is None:
+        return None
+    return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+
+@app.route("/debug/status")
+def debug_status():
+    """Diagnóstico geral: env vars (sem valores), conexão com o banco,
+    últimos comentários e últimos ciclos de polling (com error_message)."""
+    auth = check_admin_key()
+    if auth:
+        return auth
+
+    import urllib.parse
+    db_host = None
+    if SUPABASE_DB_URL:
+        try:
+            db_host = urllib.parse.urlparse(SUPABASE_DB_URL).hostname
+        except Exception:
+            db_host = "parse_error"
+
+    result = {
+        "env": {
+            "fb_app_id_set": bool(FB_APP_ID),
+            "fb_app_secret_set": bool(FB_APP_SECRET),
+            "fb_api_version": FB_API_VERSION,
+            "redirect_uri": REDIRECT_URI,
+            "supabase_db_set": bool(SUPABASE_DB_URL),
+            "db_host": db_host,
+            "token_secret_set": bool(ENCRYPTION_KEY),
+            "fernet_active": fernet is not None,
+            "google_api_key_set": bool(GOOGLE_API_KEY),
+            "gemini_model": GEMINI_MODEL,
+            "webhook_verify_token_set": bool(WEBHOOK_VERIFY_TOKEN),
+            "first_import_on_login": FIRST_IMPORT_ON_LOGIN,
+            "free_analysis_limit": FREE_ANALYSIS_LIMIT,
+            "cost_per_comment_brl": COST_PER_COMMENT_BRL
+        },
+        "webhook_events_in_memory": len(_WEBHOOK_EVENTS),
+        "webhook_events_note": "deque em memoria por instancia serverless — pode zerar entre invocacoes",
+        "db": {"connected": False}
+    }
+
+    try:
+        conn = get_db_connection()
+        try:
+            set_rls_client(conn, is_superadmin=True)
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM clients WHERE is_active = TRUE")
+                result["db"]["clients_active"] = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM comments")
+                result["db"]["total_comments"] = cur.fetchone()[0]
+                cur.execute("""
+                    SELECT client_id, comment_id, source, sentiment, created_time
+                    FROM comments ORDER BY created_time DESC LIMIT 5
+                """)
+                result["db"]["last_comments"] = [{
+                    "client_id": r[0], "comment_id": r[1], "source": r[2],
+                    "sentiment": r[3], "created_time": _iso(r[4])
+                } for r in cur.fetchall()]
+                cur.execute("""
+                    SELECT client_id, polled_at, posts_checked, comments_found,
+                           comments_new, comments_analyzed, error_message, triggered_by
+                    FROM poll_logs ORDER BY polled_at DESC LIMIT 10
+                """)
+                result["db"]["last_polls"] = [{
+                    "client_id": r[0], "polled_at": _iso(r[1]),
+                    "posts_checked": r[2], "comments_found": r[3],
+                    "comments_new": r[4], "comments_analyzed": r[5],
+                    "error_message": r[6], "triggered_by": r[7]
+                } for r in cur.fetchall()]
+            result["db"]["connected"] = True
+        finally:
+            conn.close()
+    except Exception as e:
+        result["db"]["error"] = str(e)
+
+    return jsonify(result)
+
+
+@app.route("/debug/client/<api_key>")
+def debug_client(api_key):
+    """Diagnóstico ponta a ponta de um cliente: token descriptografa? token
+    válido na Meta? página inscrita no webhook? último polling? leitura real
+    de posts com o token salvo?"""
+    auth = check_admin_key()
+    if auth:
+        return auth
+
+    client = get_client_by_api_key(api_key)
+    if not client:
+        return jsonify({"error": "Cliente nao encontrado"}), 404
+
+    result = {
+        "client_id": client["id"],
+        "name": client["name"],
+        "page_id": client["page_id"],
+        "page_name": client["page_name"],
+        "first_import_at": _iso(client.get("first_import_at")),
+        "backfill_status": client.get("backfill_status")
+    }
+
+    token = decrypt_token(client["access_token_encrypted"])
+    result["token_decrypts"] = bool(token)
+
+    if token:
+        # Validade do token na Meta (debug_token exige app token: id|secret)
+        try:
+            app_token = f"{FB_APP_ID}|{FB_APP_SECRET}"
+            dbg = requests.get(f"{FB_BASE_URL}/debug_token",
+                               params={"input_token": token, "access_token": app_token},
+                               timeout=30).json()
+            d = dbg.get("data", {})
+            result["token_info"] = {
+                "is_valid": d.get("is_valid"),
+                "expires_at": d.get("expires_at"),
+                "scopes": d.get("scopes"),
+                "error": dbg.get("error")
+            }
+        except Exception as e:
+            result["token_info"] = {"error": str(e)}
+
+        # Página inscrita no webhook?
+        try:
+            result["webhook_subscription"] = requests.get(
+                f"{FB_BASE_URL}/{client['page_id']}/subscribed_apps",
+                params={"access_token": token}, timeout=30).json()
+        except Exception as e:
+            result["webhook_subscription"] = {"error": str(e)}
+
+        # Leitura real de 1 post com o token salvo (prova ponta a ponta)
+        try:
+            probe = requests.get(
+                f"{FB_BASE_URL}/{client['page_id']}/posts",
+                params={"access_token": token, "limit": 1, "fields": "id,created_time"},
+                timeout=30).json()
+            result["posts_probe"] = {
+                "ok": "data" in probe,
+                "posts_returned": len(probe.get("data", [])),
+                "error": probe.get("error")
+            }
+        except Exception as e:
+            result["posts_probe"] = {"error": str(e)}
+
+    # Últimos ciclos de polling deste cliente (o N8N está chamando?)
+    try:
+        conn = get_db_connection()
+        try:
+            set_rls_client(conn, is_superadmin=True)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT polled_at, posts_checked, comments_found, comments_new,
+                           comments_analyzed, error_message, triggered_by
+                    FROM poll_logs WHERE client_id = %s
+                    ORDER BY polled_at DESC LIMIT 5
+                """, (client["id"],))
+                result["last_polls"] = [{
+                    "polled_at": _iso(r[0]), "posts_checked": r[1],
+                    "comments_found": r[2], "comments_new": r[3],
+                    "comments_analyzed": r[4], "error_message": r[5],
+                    "triggered_by": r[6]
+                } for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:
+        result["last_polls_error"] = str(e)
+
+    return jsonify(result)
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
