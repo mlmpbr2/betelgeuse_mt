@@ -1242,16 +1242,13 @@ BILLING_TEMPLATE = """
 # FLASK ROUTES
 # =============================================================================
 
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
 def nocache(response):
+    """Adiciona headers anti-cache para evitar navegador/CDN cachear paginas."""
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
 
 @app.route("/")
 def home():
@@ -1407,8 +1404,7 @@ def callback():
             </div>
             """
         
-        response = render_template_string(BASE_TEMPLATE, content=content)
-    return nocache(response)
+        return render_template_string(BASE_TEMPLATE, content=content)
 
     except Exception as e:
         return f"Erro: {str(e)}", 500
@@ -1500,7 +1496,8 @@ def client_billing(api_key):
         total_cost=total_cost,
         price=COST_PER_COMMENT_BRL
     )
-    return render_template_string(BASE_TEMPLATE, content=content)
+    response = render_template_string(BASE_TEMPLATE, content=content)
+    return nocache(response)
 
 
 @app.route("/client/<api_key>/comments")
