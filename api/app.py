@@ -104,7 +104,7 @@ def get_db_connection():
     """Conecta ao Supabase via psycopg2."""
     if not SUPABASE_DB_URL:
         raise Exception("SUPABASE_DB_URL não configurada")
-    return psycopg2.connect(SUPABASE_DB_URL, client_encoding='utf8')
+    return psycopg2.connect(SUPABASE_DB_URL, options='-c client_encoding=utf8')
 
 
 def set_rls_client(conn, client_id=None, is_superadmin=False):
@@ -1809,7 +1809,11 @@ def poll_comments_n8n():
     (comentarios/sentimentos/percentuais/posts/alertas).
     Auth: key = api_key do cliente (a mesma do dashboard). page_id é ignorado."""
     api_key = request.args.get("key", "")
-    client = get_client_by_api_key(api_key)
+    try:
+        client = get_client_by_api_key(api_key)
+    except Exception as e:
+        print(f"[POLL_COMMENTS] Erro de banco ao buscar cliente: {e}")
+        return jsonify({"status": "error", "error": f"db: {e}"})
     if not client:
         return jsonify({"status": "error", "error": "api_key invalida"}), 404
 
@@ -1832,7 +1836,12 @@ def poll_comments_n8n():
                         "error": "token nao descriptografado — reconecte via /login"})
 
     # Dispara o polling (busca Graph API, salva, analisa sentimento)
-    poll_result = run_poll_for_client(client, access_token, triggered_by="n8n")
+    try:
+        poll_result = run_poll_for_client(client, access_token, triggered_by="n8n")
+    except Exception as e:
+        print(f"[POLL_COMMENTS] Erro no polling: {e}")
+        return jsonify({**empty_contract, **base, "status": "error",
+                        "error": f"poll: {e}"})
     if poll_result.get("status") == "error":
         return jsonify({**empty_contract, **base, "status": "error",
                         "error": poll_result.get("error"), "poll": poll_result})
