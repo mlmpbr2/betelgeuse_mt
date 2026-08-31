@@ -104,7 +104,7 @@ def get_db_connection():
     """Conecta ao Supabase via psycopg2."""
     if not SUPABASE_DB_URL:
         raise Exception("SUPABASE_DB_URL não configurada")
-    return psycopg2.connect(SUPABASE_DB_URL)
+    return psycopg2.connect(SUPABASE_DB_URL, client_encoding='utf8')
 
 
 def set_rls_client(conn, client_id=None, is_superadmin=False):
